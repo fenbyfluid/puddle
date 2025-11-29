@@ -1,0 +1,9 @@
+[package]
+name = "linpi"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = { version = "1", features = ["backtrace"] }
+bitflags = { version = "2" }
+clap = { version = "4", features = ["derive"] }
