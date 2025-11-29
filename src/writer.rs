@@ -19,7 +19,7 @@ impl<'a> Writer<'a> {
         self.buf.len().saturating_sub(self.idx)
     }
 
-    fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+    pub fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
         let needed = bytes.len();
 
         if self.idx + needed > self.buf.len() {

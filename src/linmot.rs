@@ -1,6 +1,6 @@
 use crate::reader::{Reader, WireRead};
 use crate::writer::{WireWrite, Writer};
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use bitflags::bitflags;
 
 pub static CONTROL_MASTER_PORT: u16 = 0xA0B0;
@@ -246,18 +246,68 @@ impl WireRead for State {
     }
 }
 
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Command {
+    #[default]
+    NoOperation,
+    VaiGoToPos {
+        target_position: i32,
+        maximal_velocity: u32,
+        acceleration: u32,
+        deceleration: u32,
+    },
+}
+
+impl Command {
+    fn id(&self) -> u16 {
+        match self {
+            Self::NoOperation => 0x000,
+            Self::VaiGoToPos { .. } => 0x010,
+        }
+    }
+
+    fn write_parameters(&self, w: &mut Writer) -> Result<()> {
+        match self {
+            Self::NoOperation => {}
+            Self::VaiGoToPos { target_position, maximal_velocity, acceleration, deceleration } => {
+                target_position.write_to(w)?;
+                maximal_velocity.write_to(w)?;
+                acceleration.write_to(w)?;
+                deceleration.write_to(w)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MotionCommand {
-    pub command: u16,
-    pub params: [u16; 15],
+    pub count: u8,
+    pub command: Command,
 }
 
 impl WireWrite for MotionCommand {
     fn write_to(&self, w: &mut Writer) -> Result<()> {
-        self.command.write_to(w)?;
+        let header = (self.command.id() << 4) | (self.count & 0xF) as u16;
+        header.write_to(w)?;
 
-        for v in &self.params {
-            v.write_to(w)?;
+        let before = w.pos();
+        self.command.write_parameters(w)?;
+        let after = w.pos();
+
+        let parameters_len = after - before;
+        if parameters_len > 30 {
+            // Header (2) + parameters must fit into 32 bytes
+            return Err(anyhow!("motion command parameters too large: {} bytes (max 30)", parameters_len));
+        }
+
+        // Pad the remainder of the 32-byte command block with zeros
+        let pad_len = 32 - 2 - parameters_len;
+        if pad_len > 0 {
+            let zeros = [0u8; 32];
+            w.write_bytes(&zeros[..pad_len])?;
         }
 
         Ok(())
@@ -364,7 +414,7 @@ impl Response {
         let request_flags = RequestFlags::from_bits_truncate(rd.read_u32_le()?);
         let mut response_flags = ResponseFlags::from_bits_truncate(rd.read_u32_le()?);
 
-        // The response only includes the realtime configuration if it was specified in the request
+        // The response only includes the realtime configuration if it was also specified in the request
         if !request_flags.contains(RequestFlags::REALTIME_CONFIGURATION) {
             response_flags.remove(ResponseFlags::REALTIME_CONFIGURATION);
         }
