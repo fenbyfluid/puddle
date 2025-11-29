@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use linmot::{CONTROL_BUFFER_SIZE, CONTROL_DRIVE_PORT, CONTROL_MASTER_PORT, Request, Response, ResponseFlags};
+use linmot::udp::{BUFFER_SIZE, DRIVE_PORT, MASTER_PORT, Request, Response, ResponseFlags};
 use std::net::{Ipv4Addr, UdpSocket};
 use std::thread::sleep;
 use std::time::Duration;
@@ -24,13 +24,13 @@ fn main() -> Result<()> {
 }
 
 fn connect_to_drive(addr: &str) -> Result<()> {
-    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, CONTROL_MASTER_PORT))?;
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, MASTER_PORT))?;
     socket.set_read_timeout(Some(Duration::from_secs(1)))?;
-    socket.connect((addr, CONTROL_DRIVE_PORT))?;
+    socket.connect((addr, DRIVE_PORT))?;
 
     println!("Connected to drive at {:?} from {:?}", socket.peer_addr(), socket.local_addr());
 
-    let mut buffer = [0u8; CONTROL_BUFFER_SIZE];
+    let mut buffer = [0u8; BUFFER_SIZE];
 
     loop {
         sleep(Duration::from_secs(1));
@@ -49,30 +49,27 @@ fn connect_to_drive(addr: &str) -> Result<()> {
         let to_send = match req.to_wire(&mut buffer) {
             Ok(n) => n,
             Err(e) => {
-                println!("Failed to serialize request: {e:?}");
+                eprintln!("Failed to serialize request: {e:?}");
                 continue;
             }
         };
 
-        match socket.send(&buffer[..to_send]) {
-            Ok(_) => (),
-            Err(e) => {
-                println!("{:?}", e);
-                continue;
-            }
-        };
+        if let Err(e) = socket.send(&buffer[..to_send]) {
+            eprintln!("{e:?}");
+            continue;
+        }
 
         match socket.recv(&mut buffer) {
             Ok(received) => match Response::from_wire(&buffer[..received]) {
                 Ok(resp) => {
-                    println!("{:?}", resp);
+                    println!("{resp:?}");
                 }
                 Err(e) => {
-                    println!("Failed to parse response: {e:?}");
-                    println!("Raw: {:?}", &buffer[..received]);
+                    eprintln!("Failed to parse response: {e:?}");
+                    eprintln!("Raw: {:?}", &buffer[..received]);
                 }
             },
-            Err(e) => println!("{:?}", e),
+            Err(e) => eprintln!("{e:?}"),
         }
     }
 }

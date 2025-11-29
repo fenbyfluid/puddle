@@ -7,7 +7,7 @@ pub struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
-    pub fn new(buf: &'a [u8]) -> Self {
+    pub const fn new(buf: &'a [u8]) -> Self {
         Self { buf, idx: 0 }
     }
 
@@ -36,7 +36,8 @@ impl<'a> Reader<'a> {
     }
 
     pub fn read_i16_le(&mut self) -> Result<i16> {
-        Ok(self.read_u16_le()? as i16)
+        let b = self.read_bytes(2)?;
+        Ok(i16::from_le_bytes([b[0], b[1]]))
     }
 
     pub fn read_u32_le(&mut self) -> Result<u32> {
@@ -45,7 +46,8 @@ impl<'a> Reader<'a> {
     }
 
     pub fn read_i32_le(&mut self) -> Result<i32> {
-        Ok(self.read_u32_le()? as i32)
+        let b = self.read_bytes(4)?;
+        Ok(i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
 }
 

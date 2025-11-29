@@ -7,15 +7,15 @@ pub struct Writer<'a> {
 }
 
 impl<'a> Writer<'a> {
-    pub fn new(buf: &'a mut [u8]) -> Self {
+    pub const fn new(buf: &'a mut [u8]) -> Self {
         Self { buf, idx: 0 }
     }
 
-    pub fn pos(&self) -> usize {
+    pub const fn pos(&self) -> usize {
         self.idx
     }
 
-    pub fn remaining(&self) -> usize {
+    pub const fn remaining(&self) -> usize {
         self.buf.len().saturating_sub(self.idx)
     }
 
