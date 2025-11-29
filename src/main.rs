@@ -1,11 +1,9 @@
+use anyhow::{Context, Result};
+use clap::Parser;
+use linmot::{CONTROL_BUFFER_SIZE, CONTROL_DRIVE_PORT, CONTROL_MASTER_PORT, Request, Response, ResponseFlags};
 use std::net::{Ipv4Addr, UdpSocket};
 use std::thread::sleep;
 use std::time::Duration;
-
-use anyhow::{Context, Result};
-use clap::Parser;
-
-use linmot::{Request, Response, ResponseFlags, CONTROL_DRIVE_PORT, CONTROL_MASTER_PORT};
 
 pub mod linmot;
 mod reader;
@@ -30,26 +28,21 @@ fn connect_to_drive(addr: &str) -> Result<()> {
     socket.set_read_timeout(Some(Duration::from_secs(1)))?;
     socket.connect((addr, CONTROL_DRIVE_PORT))?;
 
-    println!(
-        "Connected to drive at {:?} from {:?}",
-        socket.peer_addr(),
-        socket.local_addr()
-    );
+    println!("Connected to drive at {:?} from {:?}", socket.peer_addr(), socket.local_addr());
 
-    let mut buffer = [0u8; 64];
+    let mut buffer = [0u8; CONTROL_BUFFER_SIZE];
 
     loop {
         sleep(Duration::from_secs(1));
 
         let req = Request {
-            response_flags: ResponseFlags::STATUS_WORD
-                | ResponseFlags::STATE_VAR
+            response_flags: ResponseFlags::STATUS_FLAGS
+                | ResponseFlags::STATE
                 | ResponseFlags::ACTUAL_POSITION
                 | ResponseFlags::DEMAND_POSITION
                 | ResponseFlags::CURRENT
-                | ResponseFlags::WARN_WORD
-                | ResponseFlags::ERROR_CODE
-                | ResponseFlags::MONITORING_CHANNEL,
+                | ResponseFlags::WARNING_FLAGS
+                | ResponseFlags::ERROR_CODE,
             ..Default::default()
         };
 

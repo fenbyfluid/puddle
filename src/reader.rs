@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 /// Simple cursor-based little-endian reader with bounds checking
 pub struct Reader<'a> {
@@ -81,5 +81,11 @@ impl WireRead for u32 {
 impl WireRead for i32 {
     fn read_from(r: &mut Reader) -> Result<Self> {
         r.read_i32_le()
+    }
+}
+
+impl<T: WireRead> WireRead for (T, T, T, T) {
+    fn read_from(r: &mut Reader) -> Result<Self> {
+        Ok((T::read_from(r)?, T::read_from(r)?, T::read_from(r)?, T::read_from(r)?))
     }
 }

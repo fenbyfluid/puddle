@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 /// Bounded little-endian writer over a preallocated buffer.
 pub struct Writer<'a> {
@@ -23,11 +23,7 @@ impl<'a> Writer<'a> {
         let needed = bytes.len();
 
         if self.idx + needed > self.buf.len() {
-            return Err(anyhow!(
-                "buffer overflow while serializing (need {}, have {})",
-                needed,
-                self.remaining()
-            ));
+            return Err(anyhow!("buffer overflow while serializing (need {}, have {})", needed, self.remaining()));
         }
 
         let end = self.idx + needed;
