@@ -1,3 +1,4 @@
+use super::units::{Acceleration, Position, Velocity};
 use crate::writer::{WireWrite, Writer};
 use anyhow::Result;
 
@@ -7,10 +8,10 @@ pub enum Command {
     #[default]
     NoOperation,
     VaiGoToPos {
-        target_position: i32,
-        maximal_velocity: u32,
-        acceleration: u32,
-        deceleration: u32,
+        target_position: Position,
+        maximal_velocity: Velocity,
+        acceleration: Acceleration,
+        deceleration: Acceleration,
     },
 }
 

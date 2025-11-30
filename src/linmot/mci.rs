@@ -4,6 +4,7 @@ use anyhow::{Result, anyhow};
 use bitflags::bitflags;
 
 mod commands;
+pub mod units;
 
 pub use commands::Command;
 
@@ -89,8 +90,8 @@ pub enum ErrorCode {
     UnknownMotionCommand,
     PvtBufferOverflow,
     PvtBufferUnderflow,
-    PvtMasterTooFast,
-    PvtMasterTooSlow,
+    PvtControllerTooFast,
+    PvtControllerTooSlow,
     MotionCommandInWrongState,
     Unknown(u16),
 }
@@ -114,8 +115,8 @@ impl From<u16> for ErrorCode {
             0x81 => Self::UnknownMotionCommand,
             0x82 => Self::PvtBufferOverflow,
             0x83 => Self::PvtBufferUnderflow,
-            0x84 => Self::PvtMasterTooFast,
-            0x85 => Self::PvtMasterTooSlow,
+            0x84 => Self::PvtControllerTooFast,
+            0x85 => Self::PvtControllerTooSlow,
             0x86 => Self::MotionCommandInWrongState,
             _ => Self::Unknown(e),
         }
@@ -258,17 +259,17 @@ impl WireWrite for MotionCommand {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{units::*, *};
 
     #[test]
     fn test_motion_command_write_to() {
         let command = MotionCommand {
             count: 0,
             command: Command::VaiGoToPos {
-                target_position: 100000,
-                maximal_velocity: 1000000,
-                acceleration: 1000000,
-                deceleration: 1000000,
+                target_position: Position::from_millimeters(10),
+                maximal_velocity: Velocity::from_meters_per_second(1),
+                acceleration: Acceleration::from_meters_per_second_squared(10),
+                deceleration: Acceleration::from_meters_per_second_squared(10),
             },
         };
 

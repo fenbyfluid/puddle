@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
+use linmot::mci::units::{Acceleration, Position, Velocity};
 use linmot::mci::{Command, ControlFlags, ErrorCode, MotionCommand, State};
-use linmot::udp::{BUFFER_SIZE, DRIVE_PORT, MASTER_PORT, Request, Response, ResponseFlags};
+use linmot::udp::{BUFFER_SIZE, CONTROLLER_PORT, DRIVE_PORT, Request, Response, ResponseFlags};
 use std::net::{Ipv4Addr, UdpSocket};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -37,7 +38,7 @@ struct DriveConnection {
 
 impl DriveConnection {
     fn new(address: &str) -> Result<Self> {
-        let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, MASTER_PORT))?;
+        let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, CONTROLLER_PORT))?;
         socket.connect((address, DRIVE_PORT))?;
 
         println!("Connected to drive at {:?} from {:?}", socket.peer_addr(), socket.local_addr());
@@ -51,10 +52,10 @@ impl DriveConnection {
             acknowledge_error: true,
             pending_command_count: None,
             pending_motion_command: Some(Command::VaiGoToPos {
-                target_position: 1_500_000,
-                maximal_velocity: 1_000_000,
-                acceleration: 100_000,
-                deceleration: 100_000,
+                target_position: Position::from_millimeters(150),
+                maximal_velocity: Velocity::from_meters_per_second(1),
+                acceleration: Acceleration::from_meters_per_second_squared(1),
+                deceleration: Acceleration::from_meters_per_second_squared(1),
             }),
         })
     }
@@ -107,11 +108,17 @@ impl DriveConnection {
                         // TODO: Quick oscillating test.
                         self.pending_motion_command =
                             if let Some(Command::VaiGoToPos { target_position, .. }) = self.pending_motion_command {
+                                let new_target_position = if target_position < Position::from_millimeters(150) {
+                                    Position::from_millimeters(200)
+                                } else {
+                                    Position::from_millimeters(100)
+                                };
+
                                 Some(Command::VaiGoToPos {
-                                    target_position: if target_position < 1_500_000 { 2_000_000 } else { 1_000_000 },
-                                    maximal_velocity: 1_000_000,
-                                    acceleration: 100_000,
-                                    deceleration: 100_000,
+                                    target_position: new_target_position,
+                                    maximal_velocity: Velocity::from_meters_per_second(1),
+                                    acceleration: Acceleration::from_meters_per_second_squared(1),
+                                    deceleration: Acceleration::from_meters_per_second_squared(1),
                                 })
                             } else {
                                 None
@@ -153,7 +160,7 @@ impl DriveConnection {
     }
 
     fn start_loop(&mut self) -> Result<()> {
-        const LOOP_INTERVAL: Duration = Duration::from_micros(5_000);
+        const LOOP_INTERVAL: Duration = Duration::from_millis(5);
         const REPORT_INTERVAL: Duration = Duration::from_secs(1);
 
         println!("Loop interval: {LOOP_INTERVAL:?}");
@@ -227,7 +234,7 @@ impl DriveConnection {
         if let (Some(actual_position), Some(demand_position), Some(current)) =
             (&response.actual_position, &response.demand_position, &response.current)
         {
-            println!("Actual position: {actual_position}, Desired position: {demand_position}, Current: {current}");
+            println!("Actual Pos.: {actual_position:?}, Desired Pos.: {demand_position:?}, Current: {current:?}");
         }
 
         if let (Some(warning_flags), Some(error_code)) = (&response.warning_flags, &response.error_code)

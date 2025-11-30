@@ -1,10 +1,11 @@
+use super::mci::units::{Current, Position};
 use super::mci::{ControlFlags, ErrorCode, MotionCommand, State, StatusFlags, WarningFlags};
 use crate::reader::{Reader, WireRead};
 use crate::writer::{WireWrite, Writer};
 use anyhow::Result;
 use bitflags::bitflags;
 
-pub const MASTER_PORT: u16 = 0xA0B0;
+pub const CONTROLLER_PORT: u16 = 0xA0B0;
 pub const DRIVE_PORT: u16 = 0xC0D0;
 pub const BUFFER_SIZE: usize = 64;
 
@@ -85,9 +86,9 @@ impl Request {
 pub struct Response {
     pub status_flags: Option<StatusFlags>,
     pub state: Option<State>,
-    pub actual_position: Option<i32>,
-    pub demand_position: Option<i32>,
-    pub current: Option<i16>,
+    pub actual_position: Option<Position>,
+    pub demand_position: Option<Position>,
+    pub current: Option<Current>,
     pub warning_flags: Option<WarningFlags>,
     pub error_code: Option<ErrorCode>,
     pub monitoring_channel: Option<(u32, u32, u32, u32)>,
