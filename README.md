@@ -1,6 +1,10 @@
-# LinPi
+# Puddle
 
-LinMot servo drive controller using the LinUDPv2 interface.
+Linear servo drive controller.
+
+## Supported Hardware
+
+* LinMot C1250-MI drive with the LinUDP interface installed
 
 ## Useful Commands
 

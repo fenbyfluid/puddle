@@ -174,15 +174,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2874a2af47a2325c2001a6e6fad9b16a53b802102b528163885171cf92b15976"
 
 [[package]]
-name = "linpi"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bitflags",
- "clap",
-]
-
-[[package]]
 name = "memchr"
 version = "2.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -219,6 +210,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5ee95bc4ef87b8d5ba32e8b7714ccc834865276eab0aed5c9958d00ec45f49e8"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "puddle"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bitflags",
+ "clap",
 ]
 
 [[package]]
