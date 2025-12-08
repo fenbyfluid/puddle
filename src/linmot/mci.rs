@@ -123,6 +123,34 @@ impl From<u16> for ErrorCode {
     }
 }
 
+// TODO: This is for the USB HID API, consider implementing a more specific trait.
+impl Into<u16> for ErrorCode {
+    fn into(self) -> u16 {
+        match self {
+            Self::NoError => 0x00,
+            Self::LogicSupplyTooLow => 0x01,
+            Self::LogicSupplyTooHigh => 0x02,
+            Self::MotorSupplyTooLow => 0x03,
+            Self::MotorSupplyTooHigh => 0x04,
+            Self::MinPositionUndershot => 0x07,
+            Self::MaxPositionOvershot => 0x08,
+            Self::PositionLagAlwaysTooBig => 0x0B,
+            Self::MotorHotSensor => 0x20,
+            Self::MotorSliderMissing => 0x22,
+            Self::MotorShortTimeOverload => 0x23,
+            Self::MotorCommunicationLost => 0x45,
+            Self::NotHomed => 0x80,
+            Self::UnknownMotionCommand => 0x81,
+            Self::PvtBufferOverflow => 0x82,
+            Self::PvtBufferUnderflow => 0x83,
+            Self::PvtControllerTooFast => 0x84,
+            Self::PvtControllerTooSlow => 0x85,
+            Self::MotionCommandInWrongState => 0x86,
+            Self::Unknown(e) => e,
+        }
+    }
+}
+
 impl From<u8> for ErrorCode {
     fn from(e: u8) -> Self {
         Self::from(u16::from(e))
@@ -225,6 +253,51 @@ impl WireRead for State {
     }
 }
 
+// TODO: This is for the USB HID API, consider implementing a more specific trait.
+impl Into<u16> for State {
+    fn into(self) -> u16 {
+        let (main, sub) = match self {
+            Self::NotReadyToSwitchOn => (0, 0),
+            Self::SwitchOnDisabled => (1, 0),
+            Self::ReadyToSwitchOn => (2, 0),
+            Self::SetupError { error_code } => (3, error_code.into()),
+            Self::Error { error_code } => (4, error_code.into()),
+            Self::HardwareTests => (5, 0),
+            Self::ReadyToOperate => (6, 0),
+            Self::OperationEnabled {
+                motion_command_count,
+                event_handler,
+                motion_active,
+                in_target_position,
+                homed,
+            } => (
+                8,
+                (if homed { 1 << 7 } else { 0 })
+                    | (if in_target_position { 1 << 6 } else { 0 })
+                    | (if motion_active { 1 << 5 } else { 0 })
+                    | (if event_handler { 1 << 4 } else { 0 })
+                    | (motion_command_count & 0xF) as u16,
+            ),
+            Self::Homing { finished } => (9, if finished { 0xF } else { 0 }),
+            Self::ClearanceCheck { finished } => (10, if finished { 0xF } else { 0 }),
+            Self::GoingToInitialPosition { finished } => (11, if finished { 0xF } else { 0 }),
+            Self::Aborting => (12, 0),
+            Self::Freezing => (13, 0),
+            Self::QuickStop => (14, 0),
+            Self::GoingToPosition { finished } => (15, if finished { 0xF } else { 0 }),
+            Self::JoggingPositive { finished } => (16, if finished { 0xF } else { 0 }),
+            Self::JoggingNegative { finished } => (17, if finished { 0xF } else { 0 }),
+            Self::Linearizing => (18, 0),
+            Self::PhaseSearch => (19, 0),
+            Self::SpecialMode => (20, 0),
+            Self::BrakeDelay => (21, 0),
+            Self::Unknown { main_state, sub_state } => (main_state as u16, sub_state as u16),
+        };
+
+        (main << 8) | (sub & 0xFF)
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct MotionCommand {
     pub count: u8,
@@ -286,5 +359,23 @@ mod tests {
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
             ]
         );
+    }
+
+    #[test]
+    fn test_state_into() {
+        let state = State::OperationEnabled {
+            motion_command_count: 5,
+            event_handler: false,
+            motion_active: true,
+            in_target_position: false,
+            homed: true,
+        };
+
+        let state_bytes: u16 = state.into();
+
+        let buffer = state_bytes.to_le_bytes();
+        let mut reader = Reader::new(&buffer);
+
+        assert_eq!(State::read_from(&mut reader).unwrap(), state);
     }
 }

@@ -1,0 +1,2 @@
+# Give plugdev users access to the puddle controller
+KERNEL=="hidraw*", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="4005", GROUP="plugdev", MODE="0660"

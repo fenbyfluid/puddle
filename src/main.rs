@@ -1,3 +1,4 @@
+use crate::reader::{Reader, WireRead};
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use linmot::mci::units::{Acceleration, Position, Velocity};
@@ -11,19 +12,33 @@ pub mod linmot;
 mod reader;
 mod writer;
 
-#[derive(Parser)]
+fn from_hex(s: &str) -> Result<u16> {
+    u16::from_str_radix(s, 16).with_context(|| format!("Invalid hex value: {}", s))
+}
+
+#[derive(Parser, Clone, Debug)]
 #[command(version, about, long_about = None)]
 struct Options {
     /// Drive controller hostname or IP address
     drive_address: String,
+    /// Connect to USB remote controller
+    #[clap(short = 'u', long)]
+    enable_usb: bool,
+    /// USB remote controller VID
+    #[clap(long, value_parser=from_hex, default_value = "303A")]
+    usb_vid: u16,
+    // TODO: Eventually, use our custom PID
+    /// USB remote controller PID
+    #[clap(short = 'p', long, value_parser=from_hex, default_value = "4005")]
+    usb_pid: u16,
     /// Stroke Limit
     #[clap(short, long, default_value = "360.0")]
     stroke_limit: f64,
     /// Velocity Limit
-    #[clap(short, long, default_value = "2.0")]
+    #[clap(short, long, default_value = "1.75")]
     velocity_limit: f64,
     /// Acceleration Limit
-    #[clap(short, long, default_value = "10.0")]
+    #[clap(short, long, default_value = "9.99")]
     acceleration_limit: f64,
     /// Loop interval in milliseconds
     #[clap(short, long, default_value = "5")]
@@ -39,6 +54,16 @@ fn main() -> Result<()> {
     let stroke_params = Arc::new(Mutex::new(StrokeParams::new()));
     let last_response = Arc::new(Mutex::new(None));
 
+    #[cfg(feature = "hidapi")]
+    if options.enable_usb {
+        let options = options.clone();
+        let stroke_params = stroke_params.clone();
+        let last_response = last_response.clone();
+        std::thread::spawn(move || {
+            run_hidapi_loop(options, stroke_params, last_response).unwrap();
+        });
+    }
+
     {
         let stroke_params = stroke_params.clone();
         std::thread::spawn(move || {
@@ -51,7 +76,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct StrokeParams {
     enabled: bool,
     stopped: bool,
@@ -80,6 +105,116 @@ impl StrokeParams {
             backwards_velocity: Velocity::from_meters_per_second(1),
             backwards_acceleration: Acceleration::from_meters_per_second_squared(1),
             backwards_deceleration: Acceleration::from_meters_per_second_squared(1),
+        }
+    }
+}
+
+// TODO: This is for the USB HID API, consider implementing a more specific trait.
+impl WireRead for StrokeParams {
+    fn read_from(r: &mut Reader) -> Result<Self> {
+        let flags = r.read_u8()?;
+
+        Ok(Self {
+            enabled: (flags & 0x01) != 0,
+            stopped: (flags & 0x02) != 0,
+            start: Position::read_from(r)?,
+            end: Position::read_from(r)?,
+            direction_change_tolerance: Position::read_from(r)?,
+            forwards_velocity: Velocity::read_from(r)?,
+            forwards_acceleration: Acceleration::read_from(r)?,
+            forwards_deceleration: Acceleration::read_from(r)?,
+            backwards_velocity: Velocity::read_from(r)?,
+            backwards_acceleration: Acceleration::read_from(r)?,
+            backwards_deceleration: Acceleration::read_from(r)?,
+        })
+    }
+}
+
+#[cfg(feature = "hidapi")]
+fn run_hidapi_loop(
+    options: Options,
+    stroke_params: Arc<Mutex<StrokeParams>>,
+    last_response: Arc<Mutex<Option<Response>>>,
+) -> Result<()> {
+    use hidapi::HidApi;
+
+    let api = HidApi::new()?;
+
+    let device = api.open(options.usb_vid, options.usb_pid)?;
+
+    println!("{:#?}", &device);
+
+    let feature_report: Vec<u8> = [0x01]
+        .into_iter()
+        .chain(Position::from_millimeters_f64(options.stroke_limit).0.to_le_bytes().into_iter())
+        .chain(Velocity::from_meters_per_second_f64(options.velocity_limit).0.to_le_bytes().into_iter())
+        .chain(Acceleration::from_meters_per_second_squared_f64(options.acceleration_limit).0.to_le_bytes().into_iter())
+        .collect();
+
+    device.send_feature_report(&feature_report)?;
+
+    let mut buffer = [0u8; 64];
+
+    loop {
+        let response_report: Vec<u8> = {
+            let last_response = last_response.lock().unwrap();
+
+            match last_response.as_ref() {
+                Some(Response {
+                    status_flags: Some(status_flags),
+                    state: Some(state),
+                    actual_position: Some(actual_position),
+                    demand_position: Some(demand_position),
+                    current: Some(current),
+                    warning_flags: Some(warning_flags),
+                    error_code: Some(error_code),
+                    ..
+                }) => [0x01, 0x01]
+                    .into_iter()
+                    .chain(status_flags.bits().to_le_bytes().into_iter())
+                    .chain(u16::to_le_bytes((*state).into()).into_iter())
+                    .chain(actual_position.0.to_le_bytes().into_iter())
+                    .chain(demand_position.0.to_le_bytes().into_iter())
+                    .chain(current.0.to_le_bytes().into_iter())
+                    .chain(warning_flags.bits().to_le_bytes().into_iter())
+                    .chain(u16::to_le_bytes((*error_code).into()).into_iter())
+                    .collect(),
+                _ => {
+                    vec![0x01, 0x00]
+                }
+            }
+        };
+
+        device.write(&response_report)?;
+
+        // Use a timeout so we write the params even if we're not getting any data.
+        let read_count = device.read_timeout(&mut buffer, 1000)?;
+        if read_count == 0 {
+            continue;
+        }
+
+        // println!("USB HID: {:02x?}", &buffer[..read_count]);
+
+        let mut reader = Reader::new(&buffer);
+
+        let report_id = reader.read_u8()?;
+        if report_id != 1 {
+            continue;
+        }
+
+        let new_stroke_params = StrokeParams::read_from(&mut reader)?;
+
+        {
+            let mut stroke_params = stroke_params.lock().unwrap();
+
+            if *stroke_params == new_stroke_params {
+                continue;
+            }
+
+            println!("{:#?}", new_stroke_params);
+
+            // TODO: We may also want to sync the local params back to the USB device.
+            *stroke_params = new_stroke_params;
         }
     }
 }
@@ -166,7 +301,7 @@ fn run_input_loop(stroke_params: Arc<Mutex<StrokeParams>>) {
             }
         }
 
-        println!("{:#?}", *stroke_params)
+        println!("{:#?}", *stroke_params);
     }
 }
 
@@ -196,6 +331,8 @@ impl DriveConnection {
         stroke_params: Arc<Mutex<StrokeParams>>,
         last_response: Arc<Mutex<Option<Response>>>,
     ) -> Result<Self> {
+        println!("Connecting to drive at {}:{}...", options.drive_address, DRIVE_PORT);
+
         let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, CONTROLLER_PORT))?;
         socket.connect((options.drive_address.as_str(), DRIVE_PORT))?;
 
@@ -275,7 +412,7 @@ impl DriveConnection {
             ..Default::default()
         };
 
-        let mut last_response = self.last_response.lock().unwrap();
+        let last_response = { self.last_response.lock().unwrap().clone() };
 
         // TODO: We currently have several control bits forced in the parameter configuration,
         //       re-evaluate if we want to implement the full state machine instead.
@@ -347,7 +484,9 @@ impl DriveConnection {
         // TODO: Extend this error type to include the raw bytes that were received
         let response = Response::from_wire(&self.buffer[..received])?;
 
-        *last_response = Some(response);
+        {
+            *self.last_response.lock().unwrap() = Some(response);
+        }
 
         Ok(())
     }
@@ -397,8 +536,10 @@ impl DriveConnection {
 
                 self.print_drive_status();
 
-                let stroke_params = self.stroke_params.lock().unwrap();
-                println!("{:#?}", *stroke_params);
+                {
+                    let stroke_params = self.stroke_params.lock().unwrap();
+                    println!("{:#?}", *stroke_params);
+                }
 
                 if !loop_error_history.is_empty() && loop_error_history.len() == loop_message_count {
                     break Err(anyhow!("Too many errors in loop, aborting"));

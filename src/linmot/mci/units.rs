@@ -46,7 +46,7 @@ macro_rules! impl_std_ops {
 
 /// Position in units of 0.1 μm
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Position(i32);
+pub struct Position(pub i32);
 
 impl Position {
     #[must_use]
@@ -84,7 +84,7 @@ impl_std_ops!(Position);
 
 /// Velocity in units of 1e-6 m/s (1 μm/s)
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Velocity(i32);
+pub struct Velocity(pub i32);
 
 impl Velocity {
     #[must_use]
@@ -108,6 +108,12 @@ impl Velocity {
     }
 }
 
+impl WireRead for Velocity {
+    fn read_from(r: &mut Reader) -> Result<Self> {
+        Ok(Self(i32::read_from(r)?))
+    }
+}
+
 impl WireWrite for Velocity {
     fn write_to(&self, w: &mut Writer) -> Result<()> {
         self.0.write_to(w)
@@ -126,7 +132,7 @@ impl_std_ops!(Velocity);
 
 /// Acceleration in units of 1e-5 m/s^2 (10 μm/s^2)
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Acceleration(i32);
+pub struct Acceleration(pub i32);
 
 impl Acceleration {
     #[must_use]
@@ -150,6 +156,12 @@ impl Acceleration {
     }
 }
 
+impl WireRead for Acceleration {
+    fn read_from(r: &mut Reader) -> Result<Self> {
+        Ok(Self(i32::read_from(r)?))
+    }
+}
+
 impl WireWrite for Acceleration {
     fn write_to(&self, w: &mut Writer) -> Result<()> {
         self.0.write_to(w)
@@ -168,7 +180,7 @@ impl_std_ops!(Acceleration);
 
 /// Jerk in units of 1e-4 m/s^3 (100 μm/s^3)
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Jerk(i32);
+pub struct Jerk(pub i32);
 
 impl Jerk {
     #[must_use]
@@ -210,7 +222,7 @@ impl_std_ops!(Jerk);
 
 /// Current in units of 1 mA
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Current(i16);
+pub struct Current(pub i16);
 
 impl WireRead for Current {
     fn read_from(r: &mut Reader) -> Result<Self> {
