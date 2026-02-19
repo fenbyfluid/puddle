@@ -2,6 +2,7 @@
 name = "puddle"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 description = "Linear servo drive controller"
 publish = false
 
@@ -19,7 +20,7 @@ assets = [
 default = ["hidapi"]
 
 [dependencies]
-anyhow = { version = "1", features = ["backtrace"] }
-bitflags = { version = "2" }
-clap = { version = "4", features = ["derive"] }
-hidapi = { version = "2", features = ["macos-shared-device"], optional = true }
+anyhow = { version = "1.0.101", features = ["backtrace"] }
+bitflags = { version = "2.10.0" }
+clap = { version = "4.5.53", features = ["derive"] }
+hidapi = { version = "2.6.3", features = ["macos-shared-device"], optional = true }

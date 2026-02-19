@@ -586,10 +586,10 @@ impl DriveConnection {
             println!("Actual Pos.: {actual_position:?}, Desired Pos.: {demand_position:?}, Current: {current:?}");
         }
 
-        if let (Some(warning_flags), Some(error_code)) = (&response.warning_flags, &response.error_code)
-            && (!warning_flags.is_empty() || *error_code != ErrorCode::NoError)
-        {
-            println!("Warnings: {warning_flags:?}, Error: {error_code:?}");
+        if let (Some(warning_flags), Some(error_code)) = (&response.warning_flags, &response.error_code) {
+            if !warning_flags.is_empty() || *error_code != ErrorCode::NoError {
+                println!("Warnings: {warning_flags:?}, Error: {error_code:?}");
+            }
         }
     }
 }
