@@ -2,6 +2,18 @@
 name = "puddle"
 version = "0.1.0"
 edition = "2024"
+description = "Linear servo drive controller"
+publish = false
+
+[package.metadata.deb]
+maintainer = "Erin <fenbyfluid@gmail.com>"
+maintainer-scripts = "debian/"
+systemd-units = { enable = false, start = false }
+assets = [
+    "$auto",
+    ["debian/puddle.udev", "lib/udev/rules.d/60-puddle.rules", "644"],
+    ["debian/puddle.conf", "etc/systemd/system/puddle.service.d/override.conf", "644"],
+]
 
 [features]
 default = ["hidapi"]

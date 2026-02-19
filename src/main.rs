@@ -224,7 +224,11 @@ fn run_input_loop(stroke_params: Arc<Mutex<StrokeParams>>) {
 
     loop {
         input.clear();
-        std::io::stdin().read_line(&mut input).unwrap();
+        let bytes_read = std::io::stdin().read_line(&mut input).unwrap();
+        if bytes_read == 0 {
+            // If no bytes were read, we've hit EOF.
+            break;
+        }
 
         let (command, value) = match input.split_once(' ') {
             Some((command, value)) => (command, value.trim_end().parse().ok()),

@@ -1,0 +1,12 @@
+[Unit]
+Description=Puddle Controller
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Restart=on-failure
+RestartSec=10s
+ExecStart=/usr/bin/puddle --enable-usb ${PUDDLE_DRIVE_ADDRESS}
+
+[Install]
+WantedBy=multi-user.target
