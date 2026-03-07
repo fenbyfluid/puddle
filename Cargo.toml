@@ -9,7 +9,10 @@ publish = false
 [package.metadata.deb]
 maintainer = "Erin <fenbyfluid@gmail.com>"
 maintainer-scripts = "debian/"
-systemd-units = { enable = false, start = false }
+systemd-units = [
+    { enable = false, start = false },
+    { unit-name = "puddle-rpi-stats", enable = false, start = false },
+]
 assets = [
     "$auto",
     ["debian/puddle.udev", "lib/udev/rules.d/60-puddle.rules", "644"],
@@ -17,10 +20,16 @@ assets = [
 ]
 
 [features]
-default = ["hidapi"]
+default = ["hidapi", "questdb-rs"]
 
 [dependencies]
 anyhow = { version = "1.0.101", features = ["backtrace"] }
 bitflags = { version = "2.10.0" }
 clap = { version = "4.5.53", features = ["derive"] }
 hidapi = { version = "2.6.3", features = ["macos-shared-device"], optional = true }
+questdb-rs = { version = "5.0.0", default-features = false, features = ["ring-crypto", "tls-native-certs", "sync-sender-tcp"], optional = true }
+
+[[bin]]
+name = "puddle-rpi-stats"
+path = "src/bin/puddle-rpi-stats.rs"
+required-features = ["questdb-rs"]

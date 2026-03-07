@@ -1,0 +1,13 @@
+[Unit]
+Description=RPi Stats Monitoring
+After=questdb.service
+StartLimitIntervalSec=0
+
+[Service]
+Restart=always
+RestartSec=10s
+ExecStart=/usr/bin/puddle-rpi-stats
+Environment=QDB_CLIENT_CONF="tcp::addr=127.0.0.1:9009;"
+
+[Install]
+WantedBy=multi-user.target
