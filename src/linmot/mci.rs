@@ -124,29 +124,29 @@ impl From<u16> for ErrorCode {
 }
 
 // TODO: This is for the USB HID API, consider implementing a more specific trait.
-impl Into<u16> for ErrorCode {
-    fn into(self) -> u16 {
-        match self {
-            Self::NoError => 0x00,
-            Self::LogicSupplyTooLow => 0x01,
-            Self::LogicSupplyTooHigh => 0x02,
-            Self::MotorSupplyTooLow => 0x03,
-            Self::MotorSupplyTooHigh => 0x04,
-            Self::MinPositionUndershot => 0x07,
-            Self::MaxPositionOvershot => 0x08,
-            Self::PositionLagAlwaysTooBig => 0x0B,
-            Self::MotorHotSensor => 0x20,
-            Self::MotorSliderMissing => 0x22,
-            Self::MotorShortTimeOverload => 0x23,
-            Self::MotorCommunicationLost => 0x45,
-            Self::NotHomed => 0x80,
-            Self::UnknownMotionCommand => 0x81,
-            Self::PvtBufferOverflow => 0x82,
-            Self::PvtBufferUnderflow => 0x83,
-            Self::PvtControllerTooFast => 0x84,
-            Self::PvtControllerTooSlow => 0x85,
-            Self::MotionCommandInWrongState => 0x86,
-            Self::Unknown(e) => e,
+impl From<ErrorCode> for u16 {
+    fn from(val: ErrorCode) -> Self {
+        match val {
+            ErrorCode::NoError => 0x00,
+            ErrorCode::LogicSupplyTooLow => 0x01,
+            ErrorCode::LogicSupplyTooHigh => 0x02,
+            ErrorCode::MotorSupplyTooLow => 0x03,
+            ErrorCode::MotorSupplyTooHigh => 0x04,
+            ErrorCode::MinPositionUndershot => 0x07,
+            ErrorCode::MaxPositionOvershot => 0x08,
+            ErrorCode::PositionLagAlwaysTooBig => 0x0B,
+            ErrorCode::MotorHotSensor => 0x20,
+            ErrorCode::MotorSliderMissing => 0x22,
+            ErrorCode::MotorShortTimeOverload => 0x23,
+            ErrorCode::MotorCommunicationLost => 0x45,
+            ErrorCode::NotHomed => 0x80,
+            ErrorCode::UnknownMotionCommand => 0x81,
+            ErrorCode::PvtBufferOverflow => 0x82,
+            ErrorCode::PvtBufferUnderflow => 0x83,
+            ErrorCode::PvtControllerTooFast => 0x84,
+            ErrorCode::PvtControllerTooSlow => 0x85,
+            ErrorCode::MotionCommandInWrongState => 0x86,
+            ErrorCode::Unknown(e) => e,
         }
     }
 }
@@ -254,17 +254,17 @@ impl WireRead for State {
 }
 
 // TODO: This is for the USB HID API, consider implementing a more specific trait.
-impl Into<u16> for State {
-    fn into(self) -> u16 {
-        let (main, sub) = match self {
-            Self::NotReadyToSwitchOn => (0, 0),
-            Self::SwitchOnDisabled => (1, 0),
-            Self::ReadyToSwitchOn => (2, 0),
-            Self::SetupError { error_code } => (3, error_code.into()),
-            Self::Error { error_code } => (4, error_code.into()),
-            Self::HardwareTests => (5, 0),
-            Self::ReadyToOperate => (6, 0),
-            Self::OperationEnabled {
+impl From<State> for u16 {
+    fn from(val: State) -> Self {
+        let (main, sub) = match val {
+            State::NotReadyToSwitchOn => (0, 0),
+            State::SwitchOnDisabled => (1, 0),
+            State::ReadyToSwitchOn => (2, 0),
+            State::SetupError { error_code } => (3, error_code.into()),
+            State::Error { error_code } => (4, error_code.into()),
+            State::HardwareTests => (5, 0),
+            State::ReadyToOperate => (6, 0),
+            State::OperationEnabled {
                 motion_command_count,
                 event_handler,
                 motion_active,
@@ -278,20 +278,20 @@ impl Into<u16> for State {
                     | (if event_handler { 1 << 4 } else { 0 })
                     | (motion_command_count & 0xF) as u16,
             ),
-            Self::Homing { finished } => (9, if finished { 0xF } else { 0 }),
-            Self::ClearanceCheck { finished } => (10, if finished { 0xF } else { 0 }),
-            Self::GoingToInitialPosition { finished } => (11, if finished { 0xF } else { 0 }),
-            Self::Aborting => (12, 0),
-            Self::Freezing => (13, 0),
-            Self::QuickStop => (14, 0),
-            Self::GoingToPosition { finished } => (15, if finished { 0xF } else { 0 }),
-            Self::JoggingPositive { finished } => (16, if finished { 0xF } else { 0 }),
-            Self::JoggingNegative { finished } => (17, if finished { 0xF } else { 0 }),
-            Self::Linearizing => (18, 0),
-            Self::PhaseSearch => (19, 0),
-            Self::SpecialMode => (20, 0),
-            Self::BrakeDelay => (21, 0),
-            Self::Unknown { main_state, sub_state } => (main_state as u16, sub_state as u16),
+            State::Homing { finished } => (9, if finished { 0xF } else { 0 }),
+            State::ClearanceCheck { finished } => (10, if finished { 0xF } else { 0 }),
+            State::GoingToInitialPosition { finished } => (11, if finished { 0xF } else { 0 }),
+            State::Aborting => (12, 0),
+            State::Freezing => (13, 0),
+            State::QuickStop => (14, 0),
+            State::GoingToPosition { finished } => (15, if finished { 0xF } else { 0 }),
+            State::JoggingPositive { finished } => (16, if finished { 0xF } else { 0 }),
+            State::JoggingNegative { finished } => (17, if finished { 0xF } else { 0 }),
+            State::Linearizing => (18, 0),
+            State::PhaseSearch => (19, 0),
+            State::SpecialMode => (20, 0),
+            State::BrakeDelay => (21, 0),
+            State::Unknown { main_state, sub_state } => (main_state as u16, sub_state as u16),
         };
 
         (main << 8) | (sub & 0xFF)

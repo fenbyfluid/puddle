@@ -10,7 +10,7 @@ Linear servo drive controller.
 
 DHCP:
 ```
-sudo dnsmasq -d --log-dhcp --bind-interfaces --interface eth0 --dhcp-range=192.168.2.100,192.168.2.200,24h --dhcp-host=00:1a:4e:xx:xx:xx,192.168.2.2```
+sudo dnsmasq -d --log-dhcp --bind-interfaces --interface eth0 --dhcp-range=192.168.2.100,192.168.2.200,24h --dhcp-host=00:1a:4e:xx:xx:xx,192.168.2.2
 ```
 
 LinUDP Proxy:
@@ -28,3 +28,18 @@ Serial Console:
 picocom -b 38400 --omap spchex,tabhex,crhex,lfhex,8bithex,nrmhex --imap spchex,tabhex,crhex,lfhex,8bithex,nrmhex /dev/ttyAMA0
 ```
 
+## Interesting UPIDs
+| UPID | Name                    | Notes                        |
+|------|-------------------------|------------------------------|
+| 1BF3 | Max Read Out Motor Temp | Actual motor temp            |
+| 1C00 | Min. Motor Temp Reserve | 0 = Motor too hot            |
+| 1BCD | Temp Core               | Drive CPU core temp          |
+| 1BCE | Max Drive Temp          | Drive sensor temp            |
+| 1BDD | Motor Power Losses      | Motor heat production        |
+| 1E0A | Target Position         | Motion final target position |
+| 1E0B | Max Velocity            | Motion max velocity          |
+| 1E0C | Acceleration            | Motion acceleration          |
+| 1E0D | Deceleration            | Motion deceleration          |
+| 1E0E | VAI Position            | VAI demand position          |
+| 1E0F | VAI Velocity            | VAI demand velocity          |
+| 1E10 | VAI Acceleration        | VAI demand acceleration      |

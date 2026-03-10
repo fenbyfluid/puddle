@@ -2,6 +2,12 @@ use questdb::ingress::{Buffer, Sender, TimestampMicros};
 use std::io::{Read, Seek};
 use std::path::Path;
 
+/**
+ * ```sql
+ * SELECT timestamp, (cast(fan_pwm as double) / 255) * 80, (cast(fan_rpm as double) / 8000) * 80, cast(cpu_thermal_temp as double) / 1000
+ * FROM rpi_stats_hwmon WHERE timestamp IN '$now - 3h..$now' ORDER BY timestamp ASC;
+ * ```
+ */
 fn main() {
     let mut sender = Sender::from_env().unwrap();
     let mut buffer = sender.new_buffer();

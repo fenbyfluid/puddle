@@ -4,6 +4,7 @@ use clap::Parser;
 use linmot::mci::units::{Acceleration, Position, Velocity};
 use linmot::mci::{Command, ControlFlags, ErrorCode, MotionCommand, State};
 use linmot::udp::{BUFFER_SIZE, CONTROLLER_PORT, DRIVE_PORT, Request, Response, ResponseFlags};
+use questdb::ingress::{Buffer, Sender, TimestampMicros};
 use std::net::{Ipv4Addr, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -44,7 +45,7 @@ struct Options {
     #[clap(short, long, default_value = "5")]
     loop_interval: u64,
     /// Report interval in milliseconds
-    #[clap(short, long, default_value = "1000")]
+    #[clap(short, long, default_value = "10000")]
     report_interval: u64,
 }
 
@@ -211,7 +212,7 @@ fn run_hidapi_loop(
                 continue;
             }
 
-            println!("{:#?}", new_stroke_params);
+            // println!("{:#?}", new_stroke_params);
 
             // TODO: We may also want to sync the local params back to the USB device.
             *stroke_params = new_stroke_params;
@@ -327,6 +328,8 @@ struct DriveConnection {
     moving_forwards: bool,
     stroke_limits: StrokeLimits,
     stroke_params: Arc<Mutex<StrokeParams>>,
+    #[cfg(feature = "questdb-rs")]
+    metrics: Option<DriveMetrics>,
 }
 
 impl DriveConnection {
@@ -341,6 +344,13 @@ impl DriveConnection {
         socket.connect((options.drive_address.as_str(), DRIVE_PORT))?;
 
         println!("Connected to drive at {:?} from {:?}", socket.peer_addr().unwrap(), socket.local_addr().unwrap());
+
+        #[cfg(feature = "questdb-rs")]
+        let metrics = DriveMetrics::new((1000 / options.loop_interval) as usize)
+            .inspect_err(|e| {
+                eprintln!("Failed to create metrics reporter: {e}");
+            })
+            .ok();
 
         Ok(Self {
             socket,
@@ -358,6 +368,8 @@ impl DriveConnection {
                 acceleration_limit: Acceleration::from_meters_per_second_squared_f64(options.acceleration_limit),
             },
             stroke_params,
+            #[cfg(feature = "questdb-rs")]
+            metrics,
         })
     }
 
@@ -412,7 +424,8 @@ impl DriveConnection {
                 | ResponseFlags::DEMAND_POSITION
                 | ResponseFlags::CURRENT
                 | ResponseFlags::WARNING_FLAGS
-                | ResponseFlags::ERROR_CODE,
+                | ResponseFlags::ERROR_CODE
+                | ResponseFlags::MONITORING_CHANNEL,
             ..Default::default()
         };
 
@@ -488,6 +501,11 @@ impl DriveConnection {
         // TODO: Extend this error type to include the raw bytes that were received
         let response = Response::from_wire(&self.buffer[..received])?;
 
+        #[cfg(feature = "questdb-rs")]
+        if let Some(metrics) = &mut self.metrics {
+            metrics.record(&request, &response);
+        }
+
         {
             *self.last_response.lock().unwrap() = Some(response);
         }
@@ -523,7 +541,7 @@ impl DriveConnection {
             loop_duration_max = loop_duration_max.max(loop_duration);
 
             if last_loop_report.elapsed() >= self.report_interval {
-                println!();
+                // println!();
 
                 // TODO: Print the error history in a compact format
                 let avg_loop_duration = loop_duration_sum / (loop_message_count as u32);
@@ -540,10 +558,10 @@ impl DriveConnection {
 
                 self.print_drive_status();
 
-                {
-                    let stroke_params = self.stroke_params.lock().unwrap();
-                    println!("{:#?}", *stroke_params);
-                }
+                // {
+                //     let stroke_params = self.stroke_params.lock().unwrap();
+                //     println!("{:#?}", *stroke_params);
+                // }
 
                 if !loop_error_history.is_empty() && loop_error_history.len() == loop_message_count {
                     break Err(anyhow!("Too many errors in loop, aborting"));
@@ -590,6 +608,90 @@ impl DriveConnection {
             if !warning_flags.is_empty() || *error_code != ErrorCode::NoError {
                 println!("Warnings: {warning_flags:?}, Error: {error_code:?}");
             }
+        }
+    }
+}
+
+#[cfg(feature = "questdb-rs")]
+struct DriveMetrics {
+    flush_count: usize,
+    sender: Sender,
+    buffer: Buffer,
+}
+
+#[cfg(feature = "questdb-rs")]
+impl DriveMetrics {
+    fn new(flush_count: usize) -> Result<Self> {
+        let sender = Sender::from_env()?;
+        let buffer = sender.new_buffer();
+
+        Ok(Self { flush_count, sender, buffer })
+    }
+
+    fn record(&mut self, request: &Request, response: &Response) {
+        self.buffer.table("linmot_stats").unwrap();
+
+        if let Some(control_flags) = request.control_flags {
+            self.buffer.column_i64("control_flags", control_flags.bits() as i64).unwrap();
+        }
+
+        if let Some(motion_command) = &request.motion_command {
+            self.buffer.column_i64("motion_command_id", motion_command.command.id() as i64).unwrap();
+
+            if let Command::VaiGoToPos { target_position, .. } = &motion_command.command {
+                self.buffer.column_f64("target_position", target_position.0 as f64).unwrap();
+            }
+        }
+
+        // TODO: Consider packing status_flags+state+warning_flags+error_code into a single column
+        // TODO: Instead, pre-create the table on the QuestDB side to specify smaller storage data types
+
+        if let Some(status_flags) = response.status_flags {
+            self.buffer.column_i64("status_flags", status_flags.bits() as i64).unwrap();
+        }
+
+        if let Some(state) = response.state {
+            self.buffer.column_i64("state", u16::from(state) as i64).unwrap();
+        }
+
+        if let Some(actual_position) = response.actual_position {
+            self.buffer.column_i64("actual_position", actual_position.0 as i64).unwrap();
+        }
+
+        if let Some(demand_position) = response.demand_position {
+            self.buffer.column_i64("demand_position", demand_position.0 as i64).unwrap();
+        }
+
+        if let Some(current) = response.current {
+            self.buffer.column_i64("current", current.0 as i64).unwrap();
+        }
+
+        if let Some(warning_flags) = response.warning_flags {
+            self.buffer.column_i64("warning_flags", warning_flags.bits() as i64).unwrap();
+        }
+
+        if let Some(error_code) = response.error_code {
+            self.buffer.column_i64("error_code", u16::from(error_code) as i64).unwrap();
+        }
+
+        // TODO: Get the current config during startup to verify these are setup correctly in the drive.
+        if let Some((a, b, c, d)) = response.monitoring_channel {
+            let demand_velocity = i32::from_ne_bytes(a.to_ne_bytes());
+            self.buffer.column_i64("demand_velocity", demand_velocity as i64).unwrap();
+            let demand_acceleration = i32::from_ne_bytes(b.to_ne_bytes());
+            self.buffer.column_i64("demand_acceleration", demand_acceleration as i64).unwrap();
+            let drive_temp = c as u16;
+            self.buffer.column_i64("drive_temp", drive_temp as i64).unwrap();
+            let motor_temp = d as u16;
+            self.buffer.column_i64("motor_temp", motor_temp as i64).unwrap();
+        }
+
+        self.buffer.at(TimestampMicros::now()).unwrap();
+
+        if self.buffer.row_count() >= self.flush_count {
+            // TODO: We may want to move flushing to a separate thread, which'll involve moving this entire struct.
+            // TODO: Figure out our error handling needs here.
+            self.sender.flush(&mut self.buffer).unwrap();
         }
     }
 }
