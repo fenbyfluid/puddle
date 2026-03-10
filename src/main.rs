@@ -36,10 +36,10 @@ struct Options {
     #[clap(short, long, default_value = "360.0")]
     stroke_limit: f64,
     /// Velocity Limit
-    #[clap(short, long, default_value = "1.75")]
+    #[clap(short, long, default_value = "2.5")]
     velocity_limit: f64,
     /// Acceleration Limit
-    #[clap(short, long, default_value = "9.99")]
+    #[clap(short, long, default_value = "15.0")]
     acceleration_limit: f64,
     /// Loop interval in milliseconds
     #[clap(short, long, default_value = "5")]
@@ -366,6 +366,7 @@ struct DriveConnection {
     control_flags: ControlFlags,
     acknowledge_error: bool,
     moving_forwards: bool,
+    in_range: bool,
     stroke_limits: StrokeLimits,
     stroke_params: Arc<Mutex<StrokeParams>>,
     #[cfg(feature = "questdb-rs")]
@@ -418,6 +419,7 @@ impl DriveConnection {
             control_flags: ControlFlags::empty(),
             acknowledge_error: true,
             moving_forwards: false,
+            in_range: false,
             stroke_limits: StrokeLimits {
                 stroke_limit: Position::from_millimeters_f64(options.stroke_limit),
                 velocity_limit: Velocity::from_meters_per_second_f64(options.velocity_limit),
@@ -434,13 +436,37 @@ impl DriveConnection {
         params: &StrokeParams,
         moving_forwards: &mut bool,
         demand_position: &Position,
+        in_range: &mut bool,
+        demand_velocity: &Velocity,
     ) -> Command {
+        let start_position = params.start.min(limits.stroke_limit);
+        let end_position = params.end.min(limits.stroke_limit);
+
+        // TODO: There's an issue with the motor overshooting if deceleration is reduced during active deceleration.
+        //       Until we can rework the control loop, work around it by stopping on overshoot, to let our next command correct it.
+        // TODO: We're still seeing occasional overshoots with this, we're going to need to model the VAI completely.
+        if *in_range {
+            if *demand_velocity > Velocity::from_meters_per_second(0) {
+                if *demand_position >= end_position + params.direction_change_tolerance {
+                    *in_range = false;
+                    *moving_forwards = false;
+                    return Command::VaiStop { deceleration: Acceleration::from_meters_per_second_squared(10) };
+                }
+            } else {
+                if *demand_position <= start_position - params.direction_change_tolerance {
+                    *in_range = false;
+                    *moving_forwards = true;
+                    return Command::VaiStop { deceleration: Acceleration::from_meters_per_second_squared(10) };
+                }
+            }
+        } else if *demand_position >= start_position && *demand_position <= end_position {
+            *in_range = true;
+        }
+
         if *moving_forwards {
             if params.stopped {
                 return Command::VaiStop { deceleration: params.forwards_deceleration.min(limits.acceleration_limit) };
             }
-
-            let end_position = params.end.min(limits.stroke_limit);
 
             if *demand_position >= end_position - params.direction_change_tolerance {
                 *moving_forwards = false;
@@ -456,8 +482,6 @@ impl DriveConnection {
             if params.stopped {
                 return Command::VaiStop { deceleration: params.backwards_deceleration.min(limits.acceleration_limit) };
             }
-
-            let start_position = params.start.min(limits.stroke_limit);
 
             if *demand_position <= start_position + params.direction_change_tolerance {
                 *moving_forwards = true;
@@ -489,8 +513,12 @@ impl DriveConnection {
 
         // TODO: We currently have several control bits forced in the parameter configuration,
         //       re-evaluate if we want to implement the full state machine instead.
-        if let Some(Response { state: Some(state), demand_position: Some(demand_position), .. }) =
-            last_response.as_ref()
+        if let Some(Response {
+            state: Some(state),
+            demand_position: Some(demand_position),
+            monitoring_channel: Some((demand_velocity, ..)),
+            ..
+        }) = last_response.as_ref()
         {
             if *state != self.last_state {
                 // TODO: Figure out how to ignore OperationEnabled->OperationEnabled transitions if only motion_command_count changed.
@@ -516,6 +544,7 @@ impl DriveConnection {
                 State::Error { error_code } if self.acknowledge_error => {
                     println!("Acknowledging error: {error_code:?}");
 
+                    // TODO: Clearing a fatal error (e.g. slider missing) requires a drive reset.
                     self.control_flags = ControlFlags::ERROR_ACKNOWLEDGE;
                 }
                 State::OperationEnabled { homed: false, .. } => {
@@ -533,7 +562,9 @@ impl DriveConnection {
                             &self.stroke_limits,
                             &stroke_params,
                             &mut self.moving_forwards,
-                            &demand_position,
+                            demand_position,
+                            &mut self.in_range,
+                            &Velocity(i32::from_ne_bytes(demand_velocity.to_ne_bytes())),
                         );
 
                         request.motion_command = Some(MotionCommand { count: next_command_count, command });

@@ -19,6 +19,12 @@ pub enum Command {
         acceleration: Acceleration,
         deceleration: Acceleration,
     },
+    VaiGoToPosFromActPosAndActVel {
+        target_position: Position,
+        maximal_velocity: Velocity,
+        acceleration: Acceleration,
+        deceleration: Acceleration,
+    },
     VaiStop {
         deceleration: Acceleration,
     },
@@ -61,6 +67,7 @@ impl Command {
             Self::NoOperation => 0x000,
             Self::VaiGoToPos { .. } => 0x010,
             Self::VaiIncrementDemPos { .. } => 0x011,
+            Self::VaiGoToPosFromActPosAndActVel { .. } => 0x013,
             Self::VaiStop { .. } => 0x017,
             Self::PStreamWithDriveGeneratedTimeStamp { .. } => 0x030,
             Self::PvStreamWithDriveGeneratedTimeStamp { .. } => 0x031,
@@ -85,6 +92,12 @@ impl Command {
             }
             Self::VaiIncrementDemPos { position_increment, maximal_velocity, acceleration, deceleration } => {
                 position_increment.write_to(w)?;
+                maximal_velocity.write_to(w)?;
+                acceleration.write_to(w)?;
+                deceleration.write_to(w)?;
+            }
+            Self::VaiGoToPosFromActPosAndActVel { target_position, maximal_velocity, acceleration, deceleration } => {
+                target_position.write_to(w)?;
                 maximal_velocity.write_to(w)?;
                 acceleration.write_to(w)?;
                 deceleration.write_to(w)?;
