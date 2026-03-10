@@ -61,7 +61,7 @@ fn main() -> Result<()> {
         let stroke_params = stroke_params.clone();
         let last_response = last_response.clone();
         std::thread::spawn(move || {
-            run_hidapi_loop(options, stroke_params, last_response).unwrap();
+            run_hidapi_loop(&options, stroke_params, last_response).unwrap();
         });
     }
 
@@ -72,9 +72,25 @@ fn main() -> Result<()> {
         });
     }
 
-    DriveConnection::new(options, stroke_params, last_response)?.start_loop().context("Failed to connect to drive")?;
+    loop {
+        let stroke_params = stroke_params.clone();
+        let last_response = last_response.clone();
 
-    Ok(())
+        let mut connection = match DriveConnection::new(&options, stroke_params, last_response) {
+            Ok(connection) => connection,
+            Err(e) => {
+                eprintln!("Failed to connect to drive: {e}");
+                std::thread::sleep(Duration::from_secs(1));
+                continue;
+            }
+        };
+
+        if let Err(e) = connection.start_loop() {
+            eprintln!("Drive connection failed: {e}");
+        }
+
+        std::thread::sleep(Duration::from_secs(1));
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,23 +149,47 @@ impl WireRead for StrokeParams {
 
 #[cfg(feature = "hidapi")]
 fn run_hidapi_loop(
-    options: Options,
+    options: &Options,
     stroke_params: Arc<Mutex<StrokeParams>>,
     last_response: Arc<Mutex<Option<Response>>>,
 ) -> Result<()> {
     use hidapi::HidApi;
 
-    let api = HidApi::new()?;
+    let mut api = HidApi::new()?;
 
+    loop {
+        api.reset_devices()?;
+        api.add_devices(options.usb_vid, options.usb_pid)?;
+
+        if !api.device_list().any(|d| d.vendor_id() == options.usb_vid && d.product_id() == options.usb_pid) {
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        }
+
+        if let Err(r) = run_hid_device_loop(&api, options, stroke_params.clone(), last_response.clone()) {
+            println!("Error in USB HID device loop: {}", r);
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        }
+    }
+}
+
+#[cfg(feature = "hidapi")]
+fn run_hid_device_loop(
+    api: &hidapi::HidApi,
+    options: &Options,
+    stroke_params: Arc<Mutex<StrokeParams>>,
+    last_response: Arc<Mutex<Option<Response>>>,
+) -> Result<()> {
     let device = api.open(options.usb_vid, options.usb_pid)?;
 
-    println!("{:#?}", &device);
+    println!("USB device connected: {:#?}", &device);
 
     let feature_report: Vec<u8> = [0x01]
         .into_iter()
-        .chain(Position::from_millimeters_f64(options.stroke_limit).0.to_le_bytes().into_iter())
-        .chain(Velocity::from_meters_per_second_f64(options.velocity_limit).0.to_le_bytes().into_iter())
-        .chain(Acceleration::from_meters_per_second_squared_f64(options.acceleration_limit).0.to_le_bytes().into_iter())
+        .chain(Position::from_millimeters_f64(options.stroke_limit).0.to_le_bytes())
+        .chain(Velocity::from_meters_per_second_f64(options.velocity_limit).0.to_le_bytes())
+        .chain(Acceleration::from_meters_per_second_squared_f64(options.acceleration_limit).0.to_le_bytes())
         .collect();
 
     device.send_feature_report(&feature_report)?;
@@ -172,13 +212,13 @@ fn run_hidapi_loop(
                     ..
                 }) => [0x01, 0x01]
                     .into_iter()
-                    .chain(status_flags.bits().to_le_bytes().into_iter())
-                    .chain(u16::to_le_bytes((*state).into()).into_iter())
-                    .chain(actual_position.0.to_le_bytes().into_iter())
-                    .chain(demand_position.0.to_le_bytes().into_iter())
-                    .chain(current.0.to_le_bytes().into_iter())
-                    .chain(warning_flags.bits().to_le_bytes().into_iter())
-                    .chain(u16::to_le_bytes((*error_code).into()).into_iter())
+                    .chain(status_flags.bits().to_le_bytes())
+                    .chain(u16::to_le_bytes((*state).into()))
+                    .chain(actual_position.0.to_le_bytes())
+                    .chain(demand_position.0.to_le_bytes())
+                    .chain(current.0.to_le_bytes())
+                    .chain(warning_flags.bits().to_le_bytes())
+                    .chain(u16::to_le_bytes((*error_code).into()))
                     .collect(),
                 _ => {
                     vec![0x01, 0x00]
@@ -334,14 +374,30 @@ struct DriveConnection {
 
 impl DriveConnection {
     fn new(
-        options: Options,
+        options: &Options,
         stroke_params: Arc<Mutex<StrokeParams>>,
         last_response: Arc<Mutex<Option<Response>>>,
     ) -> Result<Self> {
         println!("Connecting to drive at {}:{}...", options.drive_address, DRIVE_PORT);
 
         let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, CONTROLLER_PORT))?;
+
         socket.connect((options.drive_address.as_str(), DRIVE_PORT))?;
+
+        let loop_interval = Duration::from_millis(options.loop_interval);
+        socket.set_read_timeout(Some(loop_interval * 10))?;
+
+        let mut buffer = [0u8; BUFFER_SIZE];
+
+        // Send a packet to check the drive is responding.
+        {
+            let request = Request::default();
+            let to_send = request.to_wire(&mut buffer).context("Failed to serialize request")?;
+            socket.send(&buffer[..to_send])?;
+
+            let received = socket.recv(&mut buffer)?;
+            let _response = Response::from_wire(&buffer[..received])?;
+        }
 
         println!("Connected to drive at {:?} from {:?}", socket.peer_addr().unwrap(), socket.local_addr().unwrap());
 
@@ -354,9 +410,9 @@ impl DriveConnection {
 
         Ok(Self {
             socket,
-            loop_interval: Duration::from_millis(options.loop_interval),
+            loop_interval,
             report_interval: Duration::from_millis(options.report_interval),
-            buffer: [0u8; BUFFER_SIZE],
+            buffer,
             last_response,
             last_state: State::NotReadyToSwitchOn,
             control_flags: ControlFlags::empty(),
@@ -514,8 +570,6 @@ impl DriveConnection {
     }
 
     fn start_loop(&mut self) -> Result<()> {
-        self.socket.set_read_timeout(Some(self.loop_interval / 2))?;
-
         let mut last_loop_report = Instant::now();
         let mut loop_duration_sum = Duration::ZERO;
         let mut loop_duration_min = Duration::MAX;
