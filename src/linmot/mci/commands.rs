@@ -1,4 +1,4 @@
-use super::units::{Acceleration, Position, Velocity};
+use super::units::{Acceleration, Jerk, Position, Velocity};
 use crate::writer::{WireWrite, Writer};
 use anyhow::Result;
 
@@ -58,6 +58,13 @@ pub enum Command {
         acceleration: Acceleration,
     },
     StopStream,
+    VajiGoToPos {
+        target_position: Position,
+        maximal_velocity: Velocity,
+        maximal_acceleration: Acceleration,
+        maximal_deceleration: Acceleration,
+        jerk: Jerk,
+    },
 }
 
 impl Command {
@@ -77,6 +84,7 @@ impl Command {
             Self::PvaStreamWithDriveGeneratedTimeStampAndConfiguredPeriodTime { .. } => 0x035,
             Self::PvaStreamWithControllerGeneratedTimeStamp { .. } => 0x03A,
             Self::StopStream => 0x03F,
+            Self::VajiGoToPos { .. } => 0x3A0,
         }
     }
 
@@ -135,6 +143,19 @@ impl Command {
                 acceleration.write_to(w)?;
             }
             Self::StopStream => {}
+            Self::VajiGoToPos {
+                target_position,
+                maximal_velocity,
+                maximal_acceleration,
+                maximal_deceleration,
+                jerk,
+            } => {
+                target_position.write_to(w)?;
+                maximal_velocity.write_to(w)?;
+                maximal_acceleration.write_to(w)?;
+                maximal_deceleration.write_to(w)?;
+                jerk.write_to(w)?;
+            }
         }
 
         Ok(())

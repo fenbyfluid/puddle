@@ -93,6 +93,10 @@ pub enum ErrorCode {
     PvtControllerTooFast,
     PvtControllerTooSlow,
     MotionCommandInWrongState,
+    LessCalcTimeC0,
+    LessCalcTimeC1,
+    LessCalcTimeC2,
+    LessCalcTimeC3,
     Unknown(u16),
 }
 
@@ -118,6 +122,10 @@ impl From<u16> for ErrorCode {
             0x84 => Self::PvtControllerTooFast,
             0x85 => Self::PvtControllerTooSlow,
             0x86 => Self::MotionCommandInWrongState,
+            0x90 => Self::LessCalcTimeC0,
+            0x91 => Self::LessCalcTimeC1,
+            0x92 => Self::LessCalcTimeC2,
+            0x93 => Self::LessCalcTimeC3,
             _ => Self::Unknown(e),
         }
     }
@@ -146,6 +154,10 @@ impl From<ErrorCode> for u16 {
             ErrorCode::PvtControllerTooFast => 0x84,
             ErrorCode::PvtControllerTooSlow => 0x85,
             ErrorCode::MotionCommandInWrongState => 0x86,
+            ErrorCode::LessCalcTimeC0 => 0x90,
+            ErrorCode::LessCalcTimeC1 => 0x91,
+            ErrorCode::LessCalcTimeC2 => 0x92,
+            ErrorCode::LessCalcTimeC3 => 0x93,
             ErrorCode::Unknown(e) => e,
         }
     }

@@ -1,7 +1,7 @@
 use crate::reader::{Reader, WireRead};
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
-use linmot::mci::units::{Acceleration, Position, Velocity};
+use linmot::mci::units::{Acceleration, Jerk, Position, Velocity};
 use linmot::mci::{Command, ControlFlags, ErrorCode, MotionCommand, State};
 use linmot::udp::{BUFFER_SIZE, CONTROLLER_PORT, DRIVE_PORT, Request, Response, ResponseFlags};
 use questdb::ingress::{Buffer, Sender, TimestampMicros};
@@ -41,6 +41,9 @@ struct Options {
     /// Acceleration Limit
     #[clap(short, long, default_value = "15.0")]
     acceleration_limit: f64,
+    /// Jerk Limit
+    #[clap(short, long, default_value = "5000.0")]
+    jerk_limit: f64,
     /// Loop interval in milliseconds
     #[clap(short, long, default_value = "5")]
     loop_interval: u64,
@@ -106,6 +109,7 @@ struct StrokeParams {
     backwards_velocity: Velocity,
     backwards_acceleration: Acceleration,
     backwards_deceleration: Acceleration,
+    jerk: Option<Jerk>,
 }
 
 impl StrokeParams {
@@ -122,6 +126,7 @@ impl StrokeParams {
             backwards_velocity: Velocity::from_meters_per_second(1),
             backwards_acceleration: Acceleration::from_meters_per_second_squared(1),
             backwards_deceleration: Acceleration::from_meters_per_second_squared(1),
+            jerk: None,
         }
     }
 }
@@ -143,6 +148,7 @@ impl WireRead for StrokeParams {
             backwards_velocity: Velocity::read_from(r)?,
             backwards_acceleration: Acceleration::read_from(r)?,
             backwards_deceleration: Acceleration::read_from(r)?,
+            jerk: None,
         })
     }
 }
@@ -291,6 +297,7 @@ fn run_input_loop(stroke_params: Arc<Mutex<StrokeParams>>) {
                 println!("   t = Set direction change tolerance in mm");
                 println!("   v = Set velocity in m/s");
                 println!("   a = Set acceleration in m/s²");
+                println!("   j = Set jerk in m/s³");
                 println!("  fv = Set forwards velocity in m/s");
                 println!("  fa = Set forwards acceleration in m/s²");
                 println!("  fd = Set forwards deceleration in m/s²");
@@ -326,6 +333,13 @@ fn run_input_loop(stroke_params: Arc<Mutex<StrokeParams>>) {
                 stroke_params.backwards_acceleration = stroke_params.forwards_acceleration;
                 stroke_params.backwards_deceleration = stroke_params.backwards_acceleration;
             }
+            ("j", Some(v)) => {
+                if v > 0.0 {
+                    stroke_params.jerk = Some(Jerk::from_meters_per_second_cubed_f64(v));
+                } else {
+                    stroke_params.jerk = None;
+                }
+            }
             ("fv", Some(v)) => stroke_params.forwards_velocity = Velocity::from_meters_per_second_f64(v),
             ("fa", Some(v)) => {
                 stroke_params.forwards_acceleration = Acceleration::from_meters_per_second_squared_f64(v)
@@ -354,6 +368,7 @@ struct StrokeLimits {
     stroke_limit: Position,
     velocity_limit: Velocity,
     acceleration_limit: Acceleration,
+    jerk_limit: Jerk,
 }
 
 struct DriveConnection {
@@ -417,6 +432,7 @@ impl DriveConnection {
                 stroke_limit: Position::from_millimeters_f64(options.stroke_limit),
                 velocity_limit: Velocity::from_meters_per_second_f64(options.velocity_limit),
                 acceleration_limit: Acceleration::from_meters_per_second_squared_f64(options.acceleration_limit),
+                jerk_limit: Jerk::from_meters_per_second_cubed_f64(options.jerk_limit),
             },
             stroke_params,
             #[cfg(feature = "questdb-rs")]
@@ -465,11 +481,21 @@ impl DriveConnection {
                 *moving_forwards = false;
             }
 
-            Command::VaiGoToPos {
-                target_position: end_position,
-                maximal_velocity: params.forwards_velocity.min(limits.velocity_limit),
-                acceleration: params.forwards_acceleration.min(limits.acceleration_limit),
-                deceleration: params.forwards_deceleration.min(limits.acceleration_limit),
+            if let Some(jerk) = params.jerk {
+                Command::VajiGoToPos {
+                    target_position: end_position,
+                    maximal_velocity: params.forwards_velocity.min(limits.velocity_limit),
+                    maximal_acceleration: params.forwards_acceleration.min(limits.acceleration_limit),
+                    maximal_deceleration: params.forwards_deceleration.min(limits.acceleration_limit),
+                    jerk: jerk.min(limits.jerk_limit),
+                }
+            } else {
+                Command::VaiGoToPos {
+                    target_position: end_position,
+                    maximal_velocity: params.forwards_velocity.min(limits.velocity_limit),
+                    acceleration: params.forwards_acceleration.min(limits.acceleration_limit),
+                    deceleration: params.forwards_deceleration.min(limits.acceleration_limit),
+                }
             }
         } else {
             if params.stopped {
@@ -480,11 +506,21 @@ impl DriveConnection {
                 *moving_forwards = true;
             }
 
-            Command::VaiGoToPos {
-                target_position: start_position,
-                maximal_velocity: params.backwards_velocity.min(limits.velocity_limit),
-                acceleration: params.backwards_acceleration.min(limits.acceleration_limit),
-                deceleration: params.backwards_deceleration.min(limits.acceleration_limit),
+            if let Some(jerk) = params.jerk {
+                Command::VajiGoToPos {
+                    target_position: start_position,
+                    maximal_velocity: params.backwards_velocity.min(limits.velocity_limit),
+                    maximal_acceleration: params.backwards_acceleration.min(limits.acceleration_limit),
+                    maximal_deceleration: params.backwards_deceleration.min(limits.acceleration_limit),
+                    jerk: jerk.min(limits.jerk_limit),
+                }
+            } else {
+                Command::VaiGoToPos {
+                    target_position: start_position,
+                    maximal_velocity: params.backwards_velocity.min(limits.velocity_limit),
+                    acceleration: params.backwards_acceleration.min(limits.acceleration_limit),
+                    deceleration: params.backwards_deceleration.min(limits.acceleration_limit),
+                }
             }
         }
     }
