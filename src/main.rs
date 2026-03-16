@@ -167,7 +167,7 @@ fn run_hidapi_loop(
         }
 
         if let Err(r) = run_hid_device_loop(&api, options, stroke_params.clone(), last_response.clone()) {
-            println!("Error in USB HID device loop: {}", r);
+            eprintln!("Error in USB HID device loop: {}", r);
             std::thread::sleep(Duration::from_secs(1));
             continue;
         }
@@ -402,13 +402,6 @@ impl DriveConnection {
 
         println!("Connected to drive at {:?} from {:?}", socket.peer_addr().unwrap(), socket.local_addr().unwrap());
 
-        #[cfg(feature = "questdb-rs")]
-        let metrics = DriveMetrics::new((1000 / options.loop_interval) as usize)
-            .inspect_err(|e| {
-                eprintln!("Failed to create metrics reporter: {e}");
-            })
-            .ok();
-
         Ok(Self {
             socket,
             loop_interval,
@@ -427,7 +420,7 @@ impl DriveConnection {
             },
             stroke_params,
             #[cfg(feature = "questdb-rs")]
-            metrics,
+            metrics: None,
         })
     }
 
@@ -590,7 +583,10 @@ impl DriveConnection {
 
         #[cfg(feature = "questdb-rs")]
         if let Some(metrics) = &mut self.metrics {
-            metrics.record(&request, &response);
+            if let Err(error) = metrics.record(&request, &response) {
+                eprintln!("Failed to record metrics: {error}");
+                self.metrics = None;
+            }
         }
 
         {
@@ -627,6 +623,20 @@ impl DriveConnection {
 
             if last_loop_report.elapsed() >= self.report_interval {
                 // println!();
+
+                // Attempt to reconnect the metrics reporter periodically.
+                if self.metrics.is_none() {
+                    self.metrics = match DriveMetrics::new((1000 / self.loop_interval.as_millis()) as usize) {
+                        Ok(metrics) => {
+                            eprintln!("Connected to metrics reporter");
+                            Some(metrics)
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to connect to metrics reporter: {e}");
+                            None
+                        }
+                    };
+                }
 
                 // TODO: Print the error history in a compact format
                 let avg_loop_duration = loop_duration_sum / (loop_message_count as u32);
@@ -713,7 +723,11 @@ impl DriveMetrics {
         Ok(Self { flush_count, sender, buffer })
     }
 
-    fn record(&mut self, request: &Request, response: &Response) {
+    fn record(&mut self, request: &Request, response: &Response) -> Result<()> {
+        if self.sender.must_close() {
+            return Err(anyhow!("Metrics sender must close"));
+        }
+
         self.buffer.table("linmot_stats").unwrap();
 
         if let Some(control_flags) = request.control_flags {
@@ -723,7 +737,9 @@ impl DriveMetrics {
         if let Some(motion_command) = &request.motion_command {
             self.buffer.column_i64("motion_command_id", motion_command.command.id() as i64).unwrap();
 
-            if let Command::VaiGoToPos { target_position, .. } = &motion_command.command {
+            if let Command::VaiGoToPos { target_position, .. } | Command::VajiGoToPos { target_position, .. } =
+                &motion_command.command
+            {
                 self.buffer.column_f64("target_position", target_position.0 as f64).unwrap();
             }
         }
@@ -776,7 +792,9 @@ impl DriveMetrics {
         if self.buffer.row_count() >= self.flush_count {
             // TODO: We may want to move flushing to a separate thread, which'll involve moving this entire struct.
             // TODO: Figure out our error handling needs here.
-            self.sender.flush(&mut self.buffer).unwrap();
+            self.sender.flush(&mut self.buffer)?;
         }
+
+        Ok(())
     }
 }
