@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 pub enum DriveState {
     #[default]
     Disconnected,
-    PowerOff,
+    Off,
     Preparing,
     Paused,
     Moving,

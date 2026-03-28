@@ -212,6 +212,7 @@ impl CoreManager {
 
                     {
                         let mut commands = self.drive.interface.commands.lock().unwrap();
+                        commands.power_enabled = false;
                         commands.motion_enabled = false;
                     }
 
@@ -251,7 +252,7 @@ impl CoreManager {
     fn handle_message(&mut self, controller_id: ControllerId, message: ClientMessage) -> Result<()> {
         match message {
             ClientMessage::RequestWriteAccess { seq } => {
-                let can_take_write_access = self.core_state.drive_state == DriveState::PowerOff
+                let can_take_write_access = self.core_state.drive_state == DriveState::Off
                     || self.core_state.write_access_holder.is_none()
                     || controller_id == ControllerId::Hid;
 
@@ -467,6 +468,7 @@ impl CoreManager {
                     {
                         let mut commands = self.drive.interface.commands.lock().unwrap();
                         commands.power_enabled = enabled;
+                        commands.motion_enabled = enabled && commands.motion_enabled;
                     }
 
                     self.send(Some(controller_id), CoreMessage::Ack { seq, success: true, reason: None })

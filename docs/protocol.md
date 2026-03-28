@@ -67,7 +67,7 @@ The system transitions through the following **drive states**:
 
 ```
                        ┌─────────────┐
-              ┌───────▶│  POWER OFF  │◀───────┐
+              ┌───────▶│     OFF     │◀───────┐
               │        └──────┬──────┘        │
               │               │               │
          Power Off        Power On        Acknowledge
@@ -100,7 +100,7 @@ The system transitions through the following **drive states**:
 ```
 
 - **DISCONNECTED**: Drive not connected.
-- **POWER OFF**: Drive powered down.
+- **OFF**: Drive powered down.
 - **PREPARING**: Drive powering up, performing initialisation.
 - **PAUSED**: Drive ready, motion not active. Commands may be edited.
 - **MOVING**: Executing the motion command list in a loop.

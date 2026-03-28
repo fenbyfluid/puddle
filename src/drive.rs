@@ -11,22 +11,14 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-// TODO: We need to store some equiv of the old direction_change_tolerance value somewhere.
-//       I'm torn between whether it should be a fixed value or if it should be per-command.
-//       Per-command lets a complex controller pre-calculate a curve by having commands move on
-//       earlier than the target position (I think!) - which is very valuable for continuous motion,
-//       but it may be way too powerful and it would be better to keep it as an internal fixed
-//       parameter along with our own Jerk limiter implementation.
-// TODO: Nope, the above doesn't work as it still hairpins for direction changes - instead we need
-//       to compute VAI motion segments (a hard problem) - see the LLM chat for more discussion.
-// TODO: We're experimenting dropping any sort of tolerance and instead looking for predicated overshoot instead.
-
 // Control handle held by both threads.
+// TODO: Consider flattening this, the separate actions isn't as important now, and we'd like some
+//       more consistent handling. One specific goal is that controller disconnection should be a
+//       controlled stop and then power off once the motion is complete.
 #[derive(Clone, Default)]
 pub struct DriveInterface {
     pub commands: Arc<Mutex<DriveCommands>>,
     pub actions: Arc<DriveActions>,
-    pub feedback: Arc<Mutex<DriveFeedback>>,
 }
 
 // Core->Drive communication
@@ -115,11 +107,8 @@ impl ConnectionManager {
             let mut retry_time = Duration::from_secs(1);
 
             loop {
-                {
-                    // Reset the feedback state on each connection attempt.
-                    let mut feedback = connection_interface.feedback.lock().unwrap();
-                    *feedback = DriveFeedback::default();
-                }
+                // Reset the feedback state on each connection attempt.
+                let _ = core_sender.send(CoreEvent::DriveStateUpdated(DriveFeedback::default()));
 
                 let mut connection = match Connection::new(
                     &address,
@@ -163,6 +152,7 @@ pub struct Connection {
     input_commands: Vec<CoreMotionCommand>,
     last_request: Request,
     last_response: Response,
+    last_command_index: usize,
     last_state: State,
 }
 
@@ -197,6 +187,7 @@ impl Connection {
             input_commands: Vec::new(),
             last_request: Request::default(),
             last_response: Response::default(),
+            last_command_index: 0,
             last_state: State::NotReadyToSwitchOn,
         };
 
@@ -265,6 +256,7 @@ impl Connection {
 
         self.last_response = self.send_request(&request)?;
         self.last_request = request;
+        self.last_command_index = self.active_command_index;
 
         // 2. Send feedback to the core
 
@@ -292,7 +284,7 @@ impl Connection {
 
             let feedback = DriveFeedback {
                 drive_state: match state {
-                    State::ReadyToSwitchOn => DriveState::PowerOff,
+                    State::ReadyToSwitchOn => DriveState::Off,
                     State::OperationEnabled { homed: true, .. } => {
                         if self.motion_enabled {
                             DriveState::Moving
@@ -369,6 +361,8 @@ impl Connection {
 
         if !self.power_enabled {
             self.control_flags.remove(ControlFlags::SWITCH_ON);
+
+            return Ok(());
         }
 
         // Control flags are set, now compute the next motion command
@@ -378,8 +372,6 @@ impl Connection {
             Some((demand_velocity, demand_acceleration, _, _)),
         ) = (state, self.last_response.demand_position, self.last_response.monitoring_channel)
         else {
-            self.next_motion_command = None;
-
             return Ok(());
         };
 
@@ -404,12 +396,24 @@ impl Connection {
         self.active_command_index = self.active_command_index % self.input_commands.len();
         let mut input_command = self.input_commands.get(self.active_command_index).unwrap();
 
-        // TODO: Sanity check this.
-        // TODO: Yeah, it's not working :<
-        let target_reached = if demand_velocity.0 > 0 {
-            input_command.position >= next_position
-        } else {
-            input_command.position <= next_position
+        // Check if we've reached the target by seeing if the predicted position
+        // has crossed to the far side of the target relative to where we are now.
+        let target_reached = {
+            let pos = demand_position;
+            let target = input_command.position;
+            let predicted = next_position;
+            let distance_now = target - pos;
+
+            if distance_now == Position::ZERO {
+                // Already at target
+                true
+            } else {
+                // Have we crossed the target? Sign of (target - predicted) differs
+                // from sign of (target - pos), meaning we've passed it.
+                let distance_after = target - predicted;
+                (distance_now > Position::ZERO && distance_after <= Position::ZERO)
+                    || (distance_now < Position::ZERO && distance_after >= Position::ZERO)
+            }
         };
 
         if target_reached {
@@ -442,7 +446,13 @@ impl Connection {
             return;
         };
 
-        match Record::new(loop_duration, self.last_rtt.unwrap_or_default(), &self.last_request, &self.last_response) {
+        match Record::new(
+            loop_duration,
+            self.last_rtt.unwrap_or_default(),
+            self.last_command_index,
+            &self.last_request,
+            &self.last_response,
+        ) {
             Ok(record) => {
                 if let Err(e) = sender.send(record) {
                     error!("Error sending metrics record: {}", e);

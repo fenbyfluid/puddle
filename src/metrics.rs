@@ -18,6 +18,7 @@ pub struct Record {
     timestamp: TimestampMicros,
     processing_time: Duration,
     response_time: Duration,
+    active_command_index: usize,
     command: Option<RecordCommand>,
     control_flags: ControlFlags,
     status_flags: StatusFlags,
@@ -34,7 +35,13 @@ pub struct Record {
 }
 
 impl Record {
-    pub fn new(loop_duration: Duration, last_rtt: Duration, request: &Request, response: &Response) -> Result<Self> {
+    pub fn new(
+        loop_duration: Duration,
+        last_rtt: Duration,
+        active_command_index: usize,
+        request: &Request,
+        response: &Response,
+    ) -> Result<Self> {
         let command = match request.motion_command {
             Some(MotionCommand {
                 command: Command::VaiGoToPos { target_position, maximal_velocity, acceleration, deceleration },
@@ -55,6 +62,7 @@ impl Record {
             timestamp: TimestampMicros::now(),
             processing_time: loop_duration,
             response_time: last_rtt,
+            active_command_index,
             command,
             control_flags: request.control_flags.ok_or_else(|| anyhow!("Missing control flags in request"))?,
             status_flags: response.status_flags.ok_or_else(|| anyhow!("Missing status flags in response"))?,
@@ -74,6 +82,7 @@ impl Record {
     fn add_to_buffer(&self, buffer: &mut Buffer) -> Result<()> {
         buffer.column_i64("processing_time", i64::try_from(self.processing_time.as_micros())?)?;
         buffer.column_i64("response_time", i64::try_from(self.response_time.as_micros())?)?;
+        buffer.column_i64("active_command", i64::try_from(self.active_command_index)?)?;
 
         if let Some(command) = &self.command {
             buffer.column_i64("command_position", i64::from(command.position.0))?;

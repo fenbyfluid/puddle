@@ -5,6 +5,11 @@ use std::ops;
 
 macro_rules! impl_std_ops {
     ($type:ty) => {
+        impl $type {
+            // TODO: This is wrong for only MotorTemperature
+            pub const ZERO: Self = Self(0);
+        }
+
         impl ops::Neg for $type {
             type Output = Self;
 

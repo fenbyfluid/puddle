@@ -1,6 +1,6 @@
 // DISCLAIMER:
 // This is an example / test of the Puddle WebSocket API.
-// This code was LLM-generated.
+// This code was mostly LLM-generated.
 
 use anyhow::Result;
 use clap::Parser;
@@ -61,6 +61,17 @@ struct App {
 }
 
 impl App {
+    const INITIAL_INPUTS: [i32; 8] = [
+        Position::from_millimeters(0).0,
+        Velocity::from_millimeters_per_second(500).0,
+        Acceleration::from_meters_per_second_squared_f64(2.0).0,
+        Acceleration::from_meters_per_second_squared_f64(2.0).0,
+        Position::from_millimeters(0).0,
+        Velocity::from_millimeters_per_second(500).0,
+        Acceleration::from_meters_per_second_squared_f64(2.0).0,
+        Acceleration::from_meters_per_second_squared_f64(2.0).0,
+    ];
+
     pub fn new(options: Options) -> Self {
         let (tx_to_ws, rx_from_ui) = mpsc::channel();
         let (tx_to_ui, rx_from_ws) = mpsc::channel::<CoreMessage>();
@@ -140,7 +151,7 @@ impl App {
         }
 
         Self {
-            inputs: [0; 8],
+            inputs: Self::INITIAL_INPUTS,
             input_index: 0,
             limits: None,
             state: None,
@@ -299,7 +310,7 @@ impl App {
             KeyCode::Char('p') => {
                 if has_write_access {
                     if let Some(state) = &self.state {
-                        let enabled = state.drive_state == DriveState::PowerOff;
+                        let enabled = state.drive_state == DriveState::Off;
                         let seq = self.next_seq();
                         self.send(ClientMessage::SetDrivePower { seq, enabled });
                     }
@@ -335,23 +346,29 @@ impl App {
     }
 
     fn reset_inputs(&mut self) {
-        self.inputs = [0; 8];
+        self.inputs = Self::INITIAL_INPUTS;
 
         // Send update to server if we have write access
         if let Some(state) = &self.state {
             if state.write_access_holder.is_some() {
                 let cmd = MotionCommand {
-                    position: Position(0),
-                    velocity: Velocity(0),
-                    acceleration: Acceleration(0),
-                    deceleration: Acceleration(0),
+                    position: Position(self.inputs[0]),
+                    velocity: Velocity(self.inputs[1]),
+                    acceleration: Acceleration(self.inputs[2]),
+                    deceleration: Acceleration(self.inputs[3]),
+                };
+                let cmd2 = MotionCommand {
+                    position: Position(self.inputs[4]),
+                    velocity: Velocity(self.inputs[5]),
+                    acceleration: Acceleration(self.inputs[6]),
+                    deceleration: Acceleration(self.inputs[7]),
                 };
                 let seq = self.next_seq();
                 self.send(ClientMessage::UpsertCommandSet {
                     seq,
                     set: None,
                     base_version: None,
-                    commands: vec![cmd.clone(), cmd],
+                    commands: vec![cmd, cmd2],
                 });
             }
         }
@@ -379,35 +396,23 @@ impl App {
             i32::MAX
         };
 
-        // Refined steps: Position (0.1mm vs 1mm), Velocity (1mm/s vs 10mm/s), Accel (0.1m/s^2 vs 1m/s^2)
+        // Steps: Position (0.1/1.0mm), Velocity (1/10mm/s), Accel (0.01/0.1m/s^2)
         let step = match self.input_index % 4 {
             0 => {
-                if large {
-                    10_000
-                } else {
-                    1_000
-                }
+                // Position (0.1mm tap, 1.0mm hold)
+                if large { 10_000 } else { 1_000 }
             }
             1 => {
-                if large {
-                    10_000
-                } else {
-                    1_000
-                }
+                // Velocity (1mm/s tap, 10mm/s hold)
+                if large { 10_000 } else { 1_000 }
             }
             2 => {
-                if large {
-                    10_000
-                } else {
-                    1_000
-                }
+                // Acceleration (0.01m/s^2 tap, 0.1m/s^2 hold)
+                if large { 10_000 } else { 1_000 }
             }
             3 => {
-                if large {
-                    10_000
-                } else {
-                    1_000
-                }
+                // Deceleration (0.01m/s^2 tap, 0.1m/s^2 hold)
+                if large { 10_000 } else { 1_000 }
             }
             _ => unreachable!(),
         };
@@ -510,7 +515,15 @@ impl App {
                 )
             };
 
-            let (limit_info, val_str) = if let Some(limits) = &self.limits {
+            let val_str = match i % 4 {
+                0 => format!("{:?}", Position(self.inputs[i])),
+                1 => format!("{:?}", Velocity(self.inputs[i])),
+                2 => format!("{:?}", Acceleration(self.inputs[i])),
+                3 => format!("{:?}", Acceleration(self.inputs[i])),
+                _ => unreachable!(),
+            };
+
+            let (limit_info, ratio) = if let Some(limits) = &self.limits {
                 let limit = match i % 4 {
                     0 => limits.position.0,
                     1 => limits.velocity.0,
@@ -521,14 +534,6 @@ impl App {
 
                 let ratio = if limit > 0 { (self.inputs[i] as f64 / limit as f64).clamp(0.0, 1.0) } else { 0.0 };
 
-                let val_str = match i % 4 {
-                    0 => format!("{:?}", Position(self.inputs[i])),
-                    1 => format!("{:?}", Velocity(self.inputs[i])),
-                    2 => format!("{:?}", Acceleration(self.inputs[i])),
-                    3 => format!("{:?}", Acceleration(self.inputs[i])),
-                    _ => unreachable!(),
-                };
-
                 let limit_str = match i % 4 {
                     0 => format!("{:?}", Position(limit)),
                     1 => format!("{:?}", Velocity(limit)),
@@ -537,9 +542,9 @@ impl App {
                     _ => unreachable!(),
                 };
 
-                (Some((ratio, limit_str)), val_str)
+                (Some(limit_str), ratio)
             } else {
-                (None, format!("{}", self.inputs[i]))
+                (None, 0.0)
             };
 
             let label_text = format!("{}{}", label_prefix, labels[i]);
@@ -559,7 +564,7 @@ impl App {
                 frame.render_widget(Paragraph::new(label_text).style(filled_style), row_chunks[0]);
                 frame.render_widget(Paragraph::new(val_str).style(filled_style), row_chunks[1]);
 
-                if let Some((ratio, limit_str)) = limit_info {
+                if let Some(limit_str) = limit_info {
                     let gauge = LineGauge::default()
                         .filled_style(filled_style)
                         .unfilled_style(unfilled_style)
@@ -577,25 +582,21 @@ impl App {
 
                 let l1_chunks = Layout::default()
                     .direction(Direction::Horizontal)
-                    .constraints([Constraint::Length(22), Constraint::Min(0)])
+                    .constraints([Constraint::Length(22), Constraint::Length(12), Constraint::Min(0)])
                     .split(lines[0]);
 
                 frame.render_widget(Paragraph::new(label_text).style(filled_style), l1_chunks[0]);
                 frame.render_widget(Paragraph::new(val_str).style(filled_style), l1_chunks[1]);
 
-                if let Some((ratio, limit_str)) = limit_info {
-                    let l2_chunks = Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints([Constraint::Min(0), Constraint::Length(12)])
-                        .split(lines[1]);
+                if let Some(limit_str) = limit_info {
+                    frame.render_widget(Paragraph::new(limit_str).alignment(Alignment::Right), l1_chunks[2]);
 
                     let gauge = LineGauge::default()
                         .filled_style(filled_style)
                         .unfilled_style(unfilled_style)
                         .ratio(ratio)
                         .line_set(symbols::line::THICK);
-                    frame.render_widget(gauge, l2_chunks[0]);
-                    frame.render_widget(Paragraph::new(limit_str).alignment(Alignment::Right), l2_chunks[1]);
+                    frame.render_widget(gauge, lines[1]);
                 }
             }
         }
@@ -662,30 +663,25 @@ impl App {
 
             let controls_text = format!(
                 " [W] Write Access   [P] Toggle Power   [R] Reset Inputs\n \
-                 [M] Motion Toggle  [A] Ack Error      [Q] Quit"
+                  [M] Motion Toggle  [A] Ack Error      [Q] Quit"
             );
 
-            if inner_area.width > 50 {
-                let main_chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Min(0), Constraint::Length(4)])
-                    .split(inner_area);
+            let main_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(0), Constraint::Length(4)])
+                .split(inner_area);
 
-                let telemetry_chunks = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                    .split(main_chunks[0]);
+            let telemetry_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(main_chunks[0]);
 
-                frame.render_widget(Paragraph::new(col1_text), telemetry_chunks[0]);
-                frame.render_widget(Paragraph::new(col2_text), telemetry_chunks[1]);
-                frame.render_widget(
-                    Paragraph::new(controls_text).block(Block::default().borders(Borders::TOP)),
-                    main_chunks[1],
-                );
-            } else {
-                let state_text = format!("{}\n{}\n\n{}", col1_text, col2_text, controls_text);
-                frame.render_widget(Paragraph::new(state_text).wrap(ratatui::widgets::Wrap { trim: true }), inner_area);
-            }
+            frame.render_widget(Paragraph::new(col1_text), telemetry_chunks[0]);
+            frame.render_widget(Paragraph::new(col2_text), telemetry_chunks[1]);
+            frame.render_widget(
+                Paragraph::new(controls_text).block(Block::default().borders(Borders::TOP)),
+                main_chunks[1],
+            );
         } else {
             frame.render_widget(Paragraph::new("Connecting..."), inner_area);
         }
