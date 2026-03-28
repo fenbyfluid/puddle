@@ -29,7 +29,7 @@ pub struct MotionCommand {
 }
 
 impl MotionCommand {
-    pub(crate) fn apply_fields(&mut self, fields: &MotionCommandFields) -> bool {
+    pub fn apply_fields(&mut self, fields: &MotionCommandFields) -> bool {
         let mut changed = false;
         if let Some(position) = fields.position {
             if self.position != position {

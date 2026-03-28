@@ -1,9 +1,10 @@
-use crate::messages::{ClientMessage, CoreMessage};
-use crate::{ControllerId, CoreEvent};
+use crate::CoreEvent;
 use anyhow::Result;
 use log::{debug, error, info, trace, warn};
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token, Waker};
+use puddle::ControllerId;
+use puddle::messages::{ClientMessage, CoreMessage};
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -222,7 +223,8 @@ impl Client {
             Client::Connected(mut ws, addr) => loop {
                 match ws.read() {
                     Ok(Message::Text(msg)) => {
-                        debug!("Received a WebSocket text message from {:?}: {}", addr, msg);
+                        trace!("Received a WebSocket text message from {:?}: {}", addr, msg);
+
                         match serde_json::from_str::<ClientMessage>(&msg) {
                             Ok(message) => {
                                 debug!("Parsed message: {:?}", message);

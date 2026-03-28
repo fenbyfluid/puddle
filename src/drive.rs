@@ -1,11 +1,11 @@
 use crate::CoreEvent;
-use crate::messages::{DriveState, MotionCommand as CoreMotionCommand};
 use crate::metrics::Record;
 use anyhow::Result;
 use linmot::mci::units::{Acceleration, Current, DriveTemperature, MotorTemperature, Position, Velocity};
 use linmot::mci::{Command, ControlFlags, ErrorCode, MotionCommand as MciMotionCommand, State, WarningFlags};
 use linmot::udp::{BUFFER_SIZE, CONTROLLER_PORT, DRIVE_PORT, Request, Response, ResponseFlags};
 use log::{error, info, trace, warn};
+use puddle::messages::{DriveState, MotionCommand as CoreMotionCommand};
 use std::net::{Ipv4Addr, UdpSocket};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -405,6 +405,7 @@ impl Connection {
         let mut input_command = self.input_commands.get(self.active_command_index).unwrap();
 
         // TODO: Sanity check this.
+        // TODO: Yeah, it's not working :<
         let target_reached = if demand_velocity.0 > 0 {
             input_command.position >= next_position
         } else {

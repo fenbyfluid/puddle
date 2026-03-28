@@ -1,26 +1,20 @@
 use crate::drive::{ACTION_ACK_ERROR, ACTION_RESET_INDEX, DriveFeedback};
-use crate::messages::{
-    AckFailureReason, ClientMessage, CoreMessage, DriveState, MotionAction, MotionCommand, SavedSetMetadata,
-};
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use linmot::mci::ErrorCode;
-use linmot::mci::units::{Acceleration, Current, DriveTemperature, MotorTemperature, Position, Velocity};
 use log::{trace, warn};
-use mio::Token;
-use serde::{Deserialize, Serialize};
+use puddle::messages::{
+    AckFailureReason, ClientMessage, CoreMessage, DriveState, MotionAction, MotionCommand, SavedSetMetadata,
+};
+use puddle::units::{Acceleration, Position, Velocity};
+use puddle::{ControllerId, CoreState, SystemLimits};
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::mpsc;
 use std::time::Duration;
 
 mod drive;
-#[cfg(feature = "hidapi")]
 mod hid;
-mod messages;
-#[cfg(feature = "questdb-rs")]
 mod metrics;
-#[cfg(feature = "tungstenite")]
 mod websocket;
 
 fn from_hex(s: &str) -> Result<u16> {
@@ -48,13 +42,13 @@ struct Options {
     #[clap(short = 'p', long, default_value = "8080")]
     websocket_port: u16,
     /// Stroke limit in millimeters
-    #[clap(short, long, default_value = "360.0")]
+    #[clap(long, default_value = "360.0")]
     stroke_limit: f64,
     /// Velocity limit in meters per second
-    #[clap(short, long, default_value = "2.5")]
+    #[clap(long, default_value = "2.5")]
     velocity_limit: f64,
     /// Acceleration limit in meters per second squared
-    #[clap(short, long, default_value = "15.0")]
+    #[clap(long, default_value = "15.0")]
     acceleration_limit: f64,
     /// Drive loop interval in milliseconds
     #[clap(short, long, default_value = "5")]
@@ -70,86 +64,72 @@ struct Options {
     stats_interval: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SystemLimits {
-    pub position: Position,
-    pub velocity: Velocity,
-    pub acceleration: Acceleration,
-    pub deceleration: Acceleration,
-}
+fn main() -> Result<()> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-/// Controller identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ControllerId {
-    Hid,
-    WebSocket(Token),
-}
+    let options = Options::parse();
 
-impl std::fmt::Display for ControllerId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ControllerId::Hid => write!(f, "hid"),
-            ControllerId::WebSocket(token) => write!(f, "ws-{}", token.0),
+    let (core_sender, core_receiver) = mpsc::channel();
+
+    let hid_controller = if options.enable_usb {
+        Some(hid::Controller::new(options.usb_vid, options.usb_pid, core_sender.clone())?)
+    } else {
+        None
+    };
+
+    let websocket_server = if options.enable_websocket {
+        Some(websocket::Server::new(options.websocket_port, core_sender.clone())?)
+    } else {
+        None
+    };
+
+    if hid_controller.is_none() && websocket_server.is_none() {
+        return Err(anyhow!("No controller interfaces enabled"));
+    }
+
+    let limits = SystemLimits {
+        position: Position::from_millimeters_f64(options.stroke_limit),
+        velocity: Velocity::from_meters_per_second_f64(options.velocity_limit),
+        acceleration: Acceleration::from_meters_per_second_squared_f64(options.acceleration_limit),
+        deceleration: Acceleration::from_meters_per_second_squared_f64(options.acceleration_limit),
+    };
+
+    let metrics = match metrics::MetricSender::new(
+        options.stats_table,
+        options.stats_limit,
+        Duration::from_secs(options.stats_interval),
+    ) {
+        Ok(metrics) => Some(metrics),
+        Err(e) => {
+            warn!("Metrics reporting disabled: {}", e);
+            None
         }
+    };
+
+    let drive = drive::ConnectionManager::new(
+        options.drive_address,
+        Duration::from_millis(options.loop_interval),
+        core_sender.clone(),
+        metrics.map(|m| m.sender.clone()),
+    );
+
+    let mut core_manager = CoreManager::new(limits, drive, hid_controller, websocket_server);
+
+    loop {
+        let message = match core_receiver.recv() {
+            Ok(message) => message,
+            Err(_) => break,
+        };
+
+        core_manager.handle_event(message)?;
     }
-}
 
-impl FromStr for ControllerId {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> anyhow::Result<Self> {
-        match s {
-            "hid" => Ok(ControllerId::Hid),
-            _ => {
-                let id = s.strip_prefix("ws-").ok_or_else(|| anyhow!("Invalid controller ID: {}", s))?;
-                Ok(ControllerId::WebSocket(Token(id.parse()?)))
-            }
-        }
-    }
-}
-
-impl serde::Serialize for ControllerId {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(self.to_string().as_str())
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for ControllerId {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        ControllerId::from_str(s.as_str())
-            .map_err(|_| serde::de::Error::invalid_value(serde::de::Unexpected::Str(&s), &"a controller ID"))
-    }
-}
-
-// TODO: See the comment on drive::DriveFeedback, think about trimming this down.
-#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CoreState {
-    pub drive_state: DriveState,
-    pub active_command_index: usize,
-    pub actual_position: Position,
-    pub demand_position: Position,
-    pub demand_velocity: Velocity,
-    pub demand_acceleration: Acceleration,
-    pub current_draw: Current,
-    pub drive_temperature: DriveTemperature,
-    pub motor_temperature: MotorTemperature,
-    pub warnings: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error_code: Option<String>,
-    pub command_set_version: u64,
-    pub write_access_holder: Option<ControllerId>,
+    Ok(())
 }
 
 /// Every inbound event the core processes, from any source.
 #[derive(Debug)]
-pub enum CoreEvent {
+enum CoreEvent {
     // From WebSocket or HID threads
     Connected { controller_id: ControllerId },
     Disconnected { controller_id: ControllerId },
@@ -568,67 +548,4 @@ impl CoreManager {
             deceleration: c.deceleration.clamp(Acceleration::default(), self.limits.deceleration),
         }));
     }
-}
-
-fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
-    let options = Options::parse();
-
-    let (core_sender, core_receiver) = mpsc::channel();
-
-    let hid_controller = if options.enable_usb {
-        Some(hid::Controller::new(options.usb_vid, options.usb_pid, core_sender.clone())?)
-    } else {
-        None
-    };
-
-    let websocket_server = if options.enable_websocket {
-        Some(websocket::Server::new(options.websocket_port, core_sender.clone())?)
-    } else {
-        None
-    };
-
-    if hid_controller.is_none() && websocket_server.is_none() {
-        return Err(anyhow!("No controller interfaces enabled"));
-    }
-
-    let limits = SystemLimits {
-        position: Position::from_millimeters_f64(options.stroke_limit),
-        velocity: Velocity::from_meters_per_second_f64(options.velocity_limit),
-        acceleration: Acceleration::from_meters_per_second_squared_f64(options.acceleration_limit),
-        deceleration: Acceleration::from_meters_per_second_squared_f64(options.acceleration_limit),
-    };
-
-    let metrics = match metrics::MetricSender::new(
-        options.stats_table,
-        options.stats_limit,
-        Duration::from_secs(options.stats_interval),
-    ) {
-        Ok(metrics) => Some(metrics),
-        Err(e) => {
-            warn!("Metrics reporting disabled: {}", e);
-            None
-        }
-    };
-
-    let drive = drive::ConnectionManager::new(
-        options.drive_address,
-        Duration::from_millis(options.loop_interval),
-        core_sender.clone(),
-        metrics.map(|m| m.sender.clone()),
-    );
-
-    let mut core_manager = CoreManager::new(limits, drive, hid_controller, websocket_server);
-
-    loop {
-        let message = match core_receiver.recv() {
-            Ok(message) => message,
-            Err(_) => break,
-        };
-
-        core_manager.handle_event(message)?;
-    }
-
-    Ok(())
 }

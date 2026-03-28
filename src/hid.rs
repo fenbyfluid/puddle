@@ -2,13 +2,12 @@ use crate::CoreEvent;
 use anyhow::{Result, anyhow};
 use hidapi::{HidApi, HidDevice, HidResult};
 use log::{debug, error, info, warn};
+use messages::*;
+use puddle::messages::CoreMessage;
 use std::sync::mpsc;
 use std::time::Duration;
 
 mod messages;
-
-use crate::messages::CoreMessage;
-use messages::*;
 
 pub struct Controller {}
 
