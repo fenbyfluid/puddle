@@ -1,9 +1,13 @@
-use super::mci::units::{Current, Position};
-use super::mci::{ControlFlags, ErrorCode, MotionCommand, State, StatusFlags, WarningFlags};
-use crate::reader::{Reader, WireRead};
-use crate::writer::{WireWrite, Writer};
-use anyhow::Result;
+use crate::mci::units::{Current, Position};
+use crate::mci::{ControlFlags, ErrorCode, MotionCommand, State, StatusFlags, WarningFlags};
+use crate::udp::reader::ReadError;
+use crate::udp::writer::WriteError;
 use bitflags::bitflags;
+use reader::{Reader, WireRead};
+use writer::{WireWrite, Writer};
+
+pub(crate) mod reader;
+pub(crate) mod writer;
 
 pub const CONTROLLER_PORT: u16 = 0xA0B0;
 pub const DRIVE_PORT: u16 = 0xC0D0;
@@ -15,7 +19,6 @@ bitflags! {
         const CONTROL_FLAGS = 1 << 0;
         const MOTION_COMMAND = 1 << 1;
         const REALTIME_CONFIGURATION = 1 << 2;
-        const _ = !0;
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -29,7 +32,6 @@ bitflags! {
         const ERROR_CODE = 1 << 6;
         const MONITORING_CHANNEL = 1 << 7;
         const REALTIME_CONFIGURATION = 1 << 8;
-        const _ = !0;
     }
 }
 
@@ -62,7 +64,7 @@ impl Request {
     ///
     /// # Errors
     /// Returns an error if the output buffer is too small to fit the encoded request.
-    pub fn to_wire(&self, out: &mut [u8]) -> Result<usize> {
+    pub fn to_wire(&self, out: &mut [u8]) -> Result<usize, WriteError> {
         let mut w = Writer::new(out);
 
         self.flags().bits().write_to(&mut w)?;
@@ -85,22 +87,30 @@ impl Request {
 #[derive(Debug, Default, Clone)]
 pub struct Response {
     pub status_flags: Option<StatusFlags>,
-    pub state: Option<State>,
+    pub raw_state: Option<u16>,
     pub actual_position: Option<Position>,
     pub demand_position: Option<Position>,
     pub current: Option<Current>,
     pub warning_flags: Option<WarningFlags>,
-    pub error_code: Option<ErrorCode>,
+    pub raw_error_code: Option<u16>,
     pub monitoring_channel: Option<(u32, u32, u32, u32)>,
     pub realtime_configuration: Option<RealtimeConfiguration>,
 }
 
 impl Response {
+    pub fn state(&self) -> Option<State> {
+        self.raw_state.map(State::from)
+    }
+
+    pub fn error_code(&self) -> Option<ErrorCode> {
+        self.raw_error_code.map(ErrorCode::from)
+    }
+
     /// Parses a response from the provided input buffer.
     ///
     /// # Errors
     /// Returns an error if the buffer is too small or contains invalid data for a response.
-    pub fn from_wire(buf: &[u8]) -> Result<Self> {
+    pub fn from_wire(buf: &[u8]) -> Result<Self, ReadError> {
         let mut rd = Reader::new(buf);
 
         let request_flags = RequestFlags::from_bits_truncate(rd.read_u32_le()?);
@@ -114,23 +124,28 @@ impl Response {
         Ok(Self {
             status_flags: Self::read_opt(&mut rd, response_flags, ResponseFlags::STATUS_FLAGS)?
                 .map(StatusFlags::from_bits_truncate),
-            state: Self::read_opt(&mut rd, response_flags, ResponseFlags::STATE)?,
+            raw_state: Self::read_opt(&mut rd, response_flags, ResponseFlags::STATE)?,
             actual_position: Self::read_opt(&mut rd, response_flags, ResponseFlags::ACTUAL_POSITION)?,
             demand_position: Self::read_opt(&mut rd, response_flags, ResponseFlags::DEMAND_POSITION)?,
             current: Self::read_opt(&mut rd, response_flags, ResponseFlags::CURRENT)?,
             warning_flags: Self::read_opt(&mut rd, response_flags, ResponseFlags::WARNING_FLAGS)?
                 .map(WarningFlags::from_bits_truncate),
-            error_code: Self::read_opt(&mut rd, response_flags, ResponseFlags::ERROR_CODE)?,
+            raw_error_code: Self::read_opt(&mut rd, response_flags, ResponseFlags::ERROR_CODE)?,
             monitoring_channel: Self::read_opt(&mut rd, response_flags, ResponseFlags::MONITORING_CHANNEL)?,
             realtime_configuration: Self::read_opt(&mut rd, response_flags, ResponseFlags::REALTIME_CONFIGURATION)?,
         })
     }
 
-    fn read_opt<T: WireRead>(rd: &mut Reader, flags: ResponseFlags, flag: ResponseFlags) -> Result<Option<T>> {
+    fn read_opt<T: WireRead>(
+        rd: &mut Reader,
+        flags: ResponseFlags,
+        flag: ResponseFlags,
+    ) -> Result<Option<T>, ReadError> {
         if flags.contains(flag) { T::read_from(rd).map(Some) } else { Ok(None) }
     }
 }
 
+// TODO: This is only a placeholder implementation
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RealtimeConfiguration {
     pub command: u16,
@@ -138,7 +153,7 @@ pub struct RealtimeConfiguration {
 }
 
 impl WireWrite for RealtimeConfiguration {
-    fn write_to(&self, w: &mut Writer) -> Result<()> {
+    fn write_to(&self, w: &mut Writer) -> Result<(), WriteError> {
         self.command.write_to(w)?;
 
         for v in &self.params {
@@ -150,7 +165,7 @@ impl WireWrite for RealtimeConfiguration {
 }
 
 impl WireRead for RealtimeConfiguration {
-    fn read_from(r: &mut Reader) -> Result<Self> {
+    fn read_from(r: &mut Reader) -> Result<Self, ReadError> {
         let command = u16::read_from(r)?;
 
         let mut params = [0u16; 3];

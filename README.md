@@ -59,3 +59,35 @@ picocom -b 38400 --omap spchex,tabhex,crhex,lfhex,8bithex,nrmhex --imap spchex,t
 * ~~We had a case where the drive moved the slider out of bounds despite our commands, investigate further if this happens again once we have telemetry, no hints in the log~~
 * ~~Configure drive current limits and slider bounds for safety (manually)~~
 * Option to check drive configuration hash and reconfigure everything?
+
+## New Design
+* Drive connection thread
+  * Performs initial work before spawning other threads
+  * Holds primary state
+    * Who's responsible for persistent database storage?
+    * Drive this as a series of parameters that are run as a list
+    * Optional looping or ping-pong iteration
+  * Receives commands to change state from other threads
+    * What do we do with conflicting updates from multiple threads?
+    * Always use absolute values and last write wins?
+    * Have a configuration epoch that must be mirrored back?
+  * Broadcasts state to other threads
+  * Timing-sensitive communication loop with drive
+    * Using VaiGoToPos for primary movement (Trapezoidal), maybe also VaiStop if needed
+    * Implement our own VAJI/S-Curve interpolator to smooth acceleration changes around direction changes
+    * Critically, we must never go outside our configured bounds, must not hit the reduced deceleration overshoot
+  * Push telemetry to metrics thread
+    * Last command sent, all received state, loop timing
+* Metrics thread
+  * Buffers telemetry rows from the drive connection thread
+  * Flushes to QuestDB periodically
+* HID interface thread
+  * Built using hidapi crate
+  * Writes the config params as a feature report
+  * Writes the current state as an output report
+  * Reads commands in output reports and passes them on
+* WebSocket interface thread
+  * Build using tungstenite crate
+  * Spawn a thread per client connection
+  * Broadcasts state to all clients
+  * Receives commands from clients and passes them on

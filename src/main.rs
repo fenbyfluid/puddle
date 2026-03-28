@@ -1,17 +1,27 @@
-use crate::reader::{Reader, WireRead};
+use crate::drive::{ACTION_ACK_ERROR, ACTION_RESET_INDEX, DriveFeedback};
+use crate::messages::{
+    AckFailureReason, ClientMessage, CoreMessage, DriveState, MotionAction, MotionCommand, SavedSetMetadata,
+};
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
-use linmot::mci::units::{Acceleration, Jerk, Position, Velocity};
-use linmot::mci::{Command, ControlFlags, ErrorCode, MotionCommand, State};
-use linmot::udp::{BUFFER_SIZE, CONTROLLER_PORT, DRIVE_PORT, Request, Response, ResponseFlags};
-use questdb::ingress::{Buffer, Sender, TimestampMicros};
-use std::net::{Ipv4Addr, UdpSocket};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use linmot::mci::ErrorCode;
+use linmot::mci::units::{Acceleration, Current, DriveTemperature, MotorTemperature, Position, Velocity};
+use log::{trace, warn};
+use mio::Token;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::str::FromStr;
+use std::sync::mpsc;
+use std::time::Duration;
 
-pub mod linmot;
-mod reader;
-mod writer;
+mod drive;
+#[cfg(feature = "hidapi")]
+mod hid;
+mod messages;
+#[cfg(feature = "questdb-rs")]
+mod metrics;
+#[cfg(feature = "tungstenite")]
+mod websocket;
 
 fn from_hex(s: &str) -> Result<u16> {
     u16::from_str_radix(s, 16).with_context(|| format!("Invalid hex value: {}", s))
@@ -28,809 +38,597 @@ struct Options {
     /// USB remote controller VID
     #[clap(long, value_parser=from_hex, default_value = "303A")]
     usb_vid: u16,
-    // TODO: Eventually, use our custom PID
     /// USB remote controller PID
-    #[clap(short = 'p', long, value_parser=from_hex, default_value = "4005")]
+    #[clap(long, value_parser=from_hex, default_value = "8354")]
     usb_pid: u16,
-    /// Stroke Limit
+    /// Enable WebSocket server
+    #[clap(short = 'w', long)]
+    enable_websocket: bool,
+    /// WebSocket server listen port
+    #[clap(short = 'p', long, default_value = "8080")]
+    websocket_port: u16,
+    /// Stroke limit in millimeters
     #[clap(short, long, default_value = "360.0")]
     stroke_limit: f64,
-    /// Velocity Limit
+    /// Velocity limit in meters per second
     #[clap(short, long, default_value = "2.5")]
     velocity_limit: f64,
-    /// Acceleration Limit
+    /// Acceleration limit in meters per second squared
     #[clap(short, long, default_value = "15.0")]
     acceleration_limit: f64,
-    /// Jerk Limit
-    #[clap(short, long, default_value = "5000.0")]
-    jerk_limit: f64,
-    /// Loop interval in milliseconds
+    /// Drive loop interval in milliseconds
     #[clap(short, long, default_value = "5")]
     loop_interval: u64,
-    /// Report interval in milliseconds
-    #[clap(short, long, default_value = "10000")]
-    report_interval: u64,
+    /// Metrics table name
+    #[clap(long, default_value = "puddle_stats")]
+    stats_table: String,
+    /// Metrics buffer count limit
+    #[clap(long, default_value = "75000")]
+    stats_limit: usize,
+    /// Metrics buffer time in seconds
+    #[clap(short = 's', long, default_value = "5")]
+    stats_interval: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemLimits {
+    pub position: Position,
+    pub velocity: Velocity,
+    pub acceleration: Acceleration,
+    pub deceleration: Acceleration,
+}
+
+/// Controller identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ControllerId {
+    Hid,
+    WebSocket(Token),
+}
+
+impl std::fmt::Display for ControllerId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ControllerId::Hid => write!(f, "hid"),
+            ControllerId::WebSocket(token) => write!(f, "ws-{}", token.0),
+        }
+    }
+}
+
+impl FromStr for ControllerId {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "hid" => Ok(ControllerId::Hid),
+            _ => {
+                let id = s.strip_prefix("ws-").ok_or_else(|| anyhow!("Invalid controller ID: {}", s))?;
+                Ok(ControllerId::WebSocket(Token(id.parse()?)))
+            }
+        }
+    }
+}
+
+impl serde::Serialize for ControllerId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.to_string().as_str())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ControllerId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        ControllerId::from_str(s.as_str())
+            .map_err(|_| serde::de::Error::invalid_value(serde::de::Unexpected::Str(&s), &"a controller ID"))
+    }
+}
+
+// TODO: See the comment on drive::DriveFeedback, think about trimming this down.
+#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CoreState {
+    pub drive_state: DriveState,
+    pub active_command_index: usize,
+    pub actual_position: Position,
+    pub demand_position: Position,
+    pub demand_velocity: Velocity,
+    pub demand_acceleration: Acceleration,
+    pub current_draw: Current,
+    pub drive_temperature: DriveTemperature,
+    pub motor_temperature: MotorTemperature,
+    pub warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    pub command_set_version: u64,
+    pub write_access_holder: Option<ControllerId>,
+}
+
+/// Every inbound event the core processes, from any source.
+#[derive(Debug)]
+pub enum CoreEvent {
+    // From WebSocket or HID threads
+    Connected { controller_id: ControllerId },
+    Disconnected { controller_id: ControllerId },
+    Message { controller_id: ControllerId, message: ClientMessage },
+
+    // From drive thread
+    DriveStateUpdated(DriveFeedback),
+}
+
+struct CoreManager {
+    limits: SystemLimits,
+    drive: drive::ConnectionManager,
+    hid_controller: Option<hid::Controller>,
+    websocket_server: Option<websocket::Server>,
+    core_state: CoreState,
+    active_command_set: (u64, Vec<MotionCommand>),
+    // TODO: This will be database-backed in the future
+    saved_command_sets: HashMap<String, (u64, Vec<MotionCommand>)>,
+}
+
+impl CoreManager {
+    fn new(
+        limits: SystemLimits,
+        drive: drive::ConnectionManager,
+        hid_controller: Option<hid::Controller>,
+        websocket_server: Option<websocket::Server>,
+    ) -> Self {
+        Self {
+            limits,
+            drive,
+            hid_controller,
+            websocket_server,
+            core_state: CoreState::default(),
+            active_command_set: (0, Vec::new()),
+            saved_command_sets: HashMap::new(),
+        }
+    }
+
+    fn send(&self, destination: Option<ControllerId>, message: CoreMessage) -> Result<()> {
+        trace!("Sending message to {:?}: {:?}", destination, message);
+
+        match destination {
+            Some(ControllerId::Hid) => {
+                if let Some(hid_controller) = &self.hid_controller {
+                    hid_controller.handle_message(message)
+                } else {
+                    Err(anyhow!("HID controller not enabled"))
+                }
+            }
+            Some(ControllerId::WebSocket(token)) => {
+                if let Some(websocket_server) = &self.websocket_server {
+                    websocket_server.send(Some(token), message)
+                } else {
+                    Err(anyhow!("WebSocket server not enabled"))
+                }
+            }
+            None => {
+                if let Some(hid_controller) = &self.hid_controller {
+                    hid_controller.handle_message(message.clone())?;
+                }
+                if let Some(websocket_server) = &self.websocket_server {
+                    websocket_server.send(None, message)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn handle_event(&mut self, event: CoreEvent) -> Result<()> {
+        trace!("Received core event: {:?}", event);
+
+        match event {
+            CoreEvent::Connected { controller_id } => self.send(
+                Some(controller_id),
+                CoreMessage::Connected { controller_id, limits: self.limits.clone(), state: self.core_state.clone() },
+            ),
+            CoreEvent::Disconnected { controller_id } => {
+                if self.core_state.write_access_holder == Some(controller_id) {
+                    self.core_state.write_access_holder = None;
+
+                    {
+                        let mut commands = self.drive.interface.commands.lock().unwrap();
+                        commands.motion_enabled = false;
+                    }
+
+                    self.send(
+                        None,
+                        CoreMessage::WriteAccessChanged { holder: None, previous_holder: Some(controller_id) },
+                    )
+                } else {
+                    // Nothing to do if not the write access holder.
+                    Ok(())
+                }
+            }
+            CoreEvent::Message { controller_id, message } => self.handle_message(controller_id, message),
+            CoreEvent::DriveStateUpdated(feedback) => {
+                self.core_state.drive_state = feedback.drive_state;
+                self.core_state.active_command_index = feedback.active_command_index;
+                self.core_state.actual_position = feedback.actual_position;
+                self.core_state.demand_position = feedback.demand_position;
+                self.core_state.demand_velocity = feedback.demand_velocity;
+                self.core_state.demand_acceleration = feedback.demand_acceleration;
+                self.core_state.current_draw = feedback.current_draw;
+                self.core_state.drive_temperature = feedback.drive_temperature;
+                self.core_state.motor_temperature = feedback.motor_temperature;
+                self.core_state.warnings =
+                    feedback.warning_flags.iter_names().map(|(name, _)| name.to_owned()).collect();
+                self.core_state.error_code = match feedback.error_code {
+                    ErrorCode::NoError => None,
+                    // TODO: Format this correctly
+                    error_code => Some(format!("{:?}", error_code)),
+                };
+
+                self.send(None, CoreMessage::State { seq: None, state: self.core_state.clone() })
+            }
+        }
+    }
+
+    fn handle_message(&mut self, controller_id: ControllerId, message: ClientMessage) -> Result<()> {
+        match message {
+            ClientMessage::RequestWriteAccess { seq } => {
+                let can_take_write_access = self.core_state.drive_state == DriveState::PowerOff
+                    || self.core_state.write_access_holder.is_none()
+                    || controller_id == ControllerId::Hid;
+
+                if can_take_write_access {
+                    let previous_holder = self.core_state.write_access_holder.replace(controller_id);
+                    if previous_holder != Some(controller_id) {
+                        self.send(
+                            None,
+                            CoreMessage::WriteAccessChanged { holder: Some(controller_id), previous_holder },
+                        )?;
+                    }
+                    self.send(
+                        Some(controller_id),
+                        CoreMessage::WriteAccessResult { seq, granted: true, holder: Some(controller_id) },
+                    )
+                } else {
+                    self.send(
+                        Some(controller_id),
+                        CoreMessage::WriteAccessResult {
+                            seq,
+                            granted: false,
+                            holder: self.core_state.write_access_holder,
+                        },
+                    )
+                }
+            }
+            ClientMessage::ReleaseWriteAccess { seq } => {
+                if self.core_state.write_access_holder == Some(controller_id) {
+                    self.core_state.write_access_holder = None;
+                    self.send(
+                        None,
+                        CoreMessage::WriteAccessChanged { holder: None, previous_holder: Some(controller_id) },
+                    )?;
+                    self.send(Some(controller_id), CoreMessage::Ack { seq, success: true, reason: None })
+                } else {
+                    self.send(
+                        Some(controller_id),
+                        CoreMessage::Ack { seq, success: false, reason: Some(AckFailureReason::NotWriter) },
+                    )
+                }
+            }
+            ClientMessage::GetState { seq } => {
+                self.send(Some(controller_id), CoreMessage::State { seq: Some(seq), state: self.core_state.clone() })
+            }
+            ClientMessage::GetCommandSet { seq, set } => {
+                if let Some(set_name) = &set {
+                    if let Some((version, commands)) = self.saved_command_sets.get(set_name) {
+                        self.send(
+                            Some(controller_id),
+                            CoreMessage::CommandSet { seq, set, version: *version, commands: commands.clone() },
+                        )
+                    } else {
+                        self.send(
+                            Some(controller_id),
+                            CoreMessage::Ack { seq, success: false, reason: Some(AckFailureReason::NotFound) },
+                        )
+                    }
+                } else {
+                    let (version, commands) = self.active_command_set.clone();
+                    self.send(Some(controller_id), CoreMessage::CommandSet { seq, set, version, commands })
+                }
+            }
+            ClientMessage::UpsertCommandSet { seq, set, base_version, commands: new_commands } => {
+                if let Some(set_name) = &set {
+                    if let Some((version, commands)) = self.saved_command_sets.get_mut(set_name) {
+                        if base_version.is_none() || base_version == Some(*version) {
+                            *version += 1;
+                            *commands = new_commands;
+                            let version = *version;
+                            self.send(Some(controller_id), CoreMessage::CommandResult { seq, success: true, version })
+                        } else {
+                            let version = *version;
+                            self.send(Some(controller_id), CoreMessage::CommandResult { seq, success: false, version })
+                        }
+                    } else {
+                        self.saved_command_sets.insert(set_name.clone(), (1, new_commands.clone()));
+
+                        self.send(Some(controller_id), CoreMessage::CommandResult { seq, success: true, version: 1 })
+                    }
+                } else if self.core_state.write_access_holder == Some(controller_id) {
+                    if base_version.is_none() || base_version == Some(self.active_command_set.0) {
+                        self.active_command_set = (self.active_command_set.0 + 1, new_commands);
+
+                        self.sync_commands_to_drive();
+
+                        self.drive.interface.actions.send(ACTION_RESET_INDEX);
+
+                        self.send(
+                            None,
+                            CoreMessage::CommandSetChanged { version: self.active_command_set.0, update: None },
+                        )?;
+
+                        self.send(
+                            Some(controller_id),
+                            CoreMessage::CommandResult { seq, success: true, version: self.active_command_set.0 },
+                        )
+                    } else {
+                        self.send(
+                            Some(controller_id),
+                            CoreMessage::CommandResult { seq, success: false, version: self.active_command_set.0 },
+                        )
+                    }
+                } else {
+                    self.send(
+                        Some(controller_id),
+                        CoreMessage::Ack { seq, success: false, reason: Some(AckFailureReason::NotWriter) },
+                    )
+                }
+            }
+            ClientMessage::UpdateCommand { seq, update } => {
+                if self.core_state.write_access_holder == Some(controller_id) {
+                    match self.active_command_set.1.get_mut(update.index) {
+                        Some(command) => {
+                            if command.apply_fields(&update.fields) {
+                                self.active_command_set.0 += 1;
+
+                                self.sync_commands_to_drive();
+
+                                self.send(
+                                    None,
+                                    CoreMessage::CommandSetChanged {
+                                        version: self.active_command_set.0,
+                                        update: Some(update),
+                                    },
+                                )?;
+                            }
+
+                            self.send(
+                                Some(controller_id),
+                                CoreMessage::CommandResult { seq, success: true, version: self.active_command_set.0 },
+                            )
+                        }
+                        None => self.send(
+                            Some(controller_id),
+                            CoreMessage::Ack { seq, success: false, reason: Some(AckFailureReason::OutOfRange) },
+                        ),
+                    }
+                } else {
+                    self.send(
+                        Some(controller_id),
+                        CoreMessage::Ack { seq, success: false, reason: Some(AckFailureReason::NotWriter) },
+                    )
+                }
+            }
+            ClientMessage::DeleteCommandSet { seq, set, base_version } => {
+                if let Some(set_name) = &set {
+                    if let Some((version, _commands)) = self.saved_command_sets.get(set_name) {
+                        if base_version.is_none() || base_version == Some(*version) {
+                            self.saved_command_sets.remove(set_name);
+
+                            self.send(Some(controller_id), CoreMessage::Ack { seq, success: true, reason: None })
+                        } else {
+                            self.send(
+                                Some(controller_id),
+                                CoreMessage::CommandResult { seq, success: false, version: *version },
+                            )
+                        }
+                    } else {
+                        self.send(
+                            Some(controller_id),
+                            CoreMessage::Ack { seq, success: false, reason: Some(AckFailureReason::NotFound) },
+                        )
+                    }
+                } else if self.core_state.write_access_holder == Some(controller_id) {
+                    if base_version.is_none() || base_version == Some(self.active_command_set.0) {
+                        self.active_command_set = (self.active_command_set.0 + 1, Vec::new());
+
+                        self.sync_commands_to_drive();
+
+                        self.drive.interface.actions.send(ACTION_RESET_INDEX);
+
+                        self.send(
+                            None,
+                            CoreMessage::CommandSetChanged { version: self.active_command_set.0, update: None },
+                        )?;
+
+                        self.send(
+                            Some(controller_id),
+                            CoreMessage::CommandResult { seq, success: true, version: self.active_command_set.0 },
+                        )
+                    } else {
+                        self.send(
+                            Some(controller_id),
+                            CoreMessage::CommandResult { seq, success: false, version: self.active_command_set.0 },
+                        )
+                    }
+                } else {
+                    self.send(
+                        Some(controller_id),
+                        CoreMessage::Ack { seq, success: false, reason: Some(AckFailureReason::NotWriter) },
+                    )
+                }
+            }
+            ClientMessage::ListSavedSets { seq } => {
+                self.send(
+                    Some(controller_id),
+                    CoreMessage::SavedSetList {
+                        seq,
+                        sets: self
+                            .saved_command_sets
+                            .iter()
+                            .map(|(name, (version, _commands))| SavedSetMetadata {
+                                name: name.clone(),
+                                version: *version,
+                                saved_at: "".to_string(), // TODO
+                            })
+                            .collect(),
+                    },
+                )
+            }
+            ClientMessage::SetDrivePower { seq, enabled } => {
+                if self.core_state.write_access_holder == Some(controller_id) {
+                    {
+                        let mut commands = self.drive.interface.commands.lock().unwrap();
+                        commands.power_enabled = enabled;
+                    }
+
+                    self.send(Some(controller_id), CoreMessage::Ack { seq, success: true, reason: None })
+                } else {
+                    self.send(
+                        Some(controller_id),
+                        CoreMessage::Ack { seq, success: false, reason: Some(AckFailureReason::NotWriter) },
+                    )
+                }
+            }
+            ClientMessage::SetMotionState { seq, action } => {
+                if self.core_state.write_access_holder == Some(controller_id) {
+                    let valid = match (action, self.core_state.drive_state) {
+                        (MotionAction::Start, DriveState::Paused) => true,
+                        (MotionAction::Pause, DriveState::Moving) => true,
+                        (MotionAction::Resume, DriveState::Paused) => true,
+                        (MotionAction::Stop, DriveState::Moving | DriveState::Paused) => true,
+                        _ => false,
+                    };
+
+                    if !valid {
+                        return self.send(
+                            Some(controller_id),
+                            CoreMessage::Ack { seq, success: false, reason: Some(AckFailureReason::InvalidState) },
+                        );
+                    }
+
+                    {
+                        let mut commands = self.drive.interface.commands.lock().unwrap();
+                        commands.motion_enabled = match action {
+                            MotionAction::Start | MotionAction::Resume => true,
+                            MotionAction::Stop | MotionAction::Pause => false,
+                        };
+                    }
+
+                    if action == MotionAction::Start || action == MotionAction::Stop {
+                        self.drive.interface.actions.send(ACTION_RESET_INDEX);
+                    }
+
+                    self.send(Some(controller_id), CoreMessage::Ack { seq, success: true, reason: None })
+                } else {
+                    self.send(
+                        Some(controller_id),
+                        CoreMessage::Ack { seq, success: false, reason: Some(AckFailureReason::NotWriter) },
+                    )
+                }
+            }
+            ClientMessage::AcknowledgeError { seq } => {
+                if self.core_state.write_access_holder == Some(controller_id) {
+                    if self.core_state.drive_state != DriveState::Errored {
+                        return self.send(
+                            Some(controller_id),
+                            CoreMessage::Ack { seq, success: false, reason: Some(AckFailureReason::InvalidState) },
+                        );
+                    }
+
+                    self.drive.interface.actions.send(ACTION_ACK_ERROR);
+
+                    self.send(Some(controller_id), CoreMessage::Ack { seq, success: true, reason: None })
+                } else {
+                    self.send(
+                        Some(controller_id),
+                        CoreMessage::Ack { seq, success: false, reason: Some(AckFailureReason::NotWriter) },
+                    )
+                }
+            }
+        }
+    }
+
+    fn sync_commands_to_drive(&mut self) {
+        self.core_state.command_set_version = self.active_command_set.0;
+
+        let mut commands = self.drive.interface.commands.lock().unwrap();
+        commands.commands.clear();
+        commands.commands.extend(self.active_command_set.1.iter().map(|c| MotionCommand {
+            position: c.position.clamp(Position::default(), self.limits.position),
+            velocity: c.velocity.clamp(Velocity::default(), self.limits.velocity),
+            acceleration: c.acceleration.clamp(Acceleration::default(), self.limits.acceleration),
+            deceleration: c.deceleration.clamp(Acceleration::default(), self.limits.deceleration),
+        }));
+    }
 }
 
 fn main() -> Result<()> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
     let options = Options::parse();
 
-    let stroke_params = Arc::new(Mutex::new(StrokeParams::new()));
-    let last_response = Arc::new(Mutex::new(None));
+    let (core_sender, core_receiver) = mpsc::channel();
 
-    #[cfg(feature = "hidapi")]
-    if options.enable_usb {
-        let options = options.clone();
-        let stroke_params = stroke_params.clone();
-        let last_response = last_response.clone();
-        std::thread::spawn(move || {
-            run_hidapi_loop(&options, stroke_params, last_response).unwrap();
-        });
+    let hid_controller = if options.enable_usb {
+        Some(hid::Controller::new(options.usb_vid, options.usb_pid, core_sender.clone())?)
+    } else {
+        None
+    };
+
+    let websocket_server = if options.enable_websocket {
+        Some(websocket::Server::new(options.websocket_port, core_sender.clone())?)
+    } else {
+        None
+    };
+
+    if hid_controller.is_none() && websocket_server.is_none() {
+        return Err(anyhow!("No controller interfaces enabled"));
     }
 
-    {
-        let stroke_params = stroke_params.clone();
-        std::thread::spawn(move || {
-            run_input_loop(stroke_params);
-        });
-    }
+    let limits = SystemLimits {
+        position: Position::from_millimeters_f64(options.stroke_limit),
+        velocity: Velocity::from_meters_per_second_f64(options.velocity_limit),
+        acceleration: Acceleration::from_meters_per_second_squared_f64(options.acceleration_limit),
+        deceleration: Acceleration::from_meters_per_second_squared_f64(options.acceleration_limit),
+    };
+
+    let metrics = match metrics::MetricSender::new(
+        options.stats_table,
+        options.stats_limit,
+        Duration::from_secs(options.stats_interval),
+    ) {
+        Ok(metrics) => Some(metrics),
+        Err(e) => {
+            warn!("Metrics reporting disabled: {}", e);
+            None
+        }
+    };
+
+    let drive = drive::ConnectionManager::new(
+        options.drive_address,
+        Duration::from_millis(options.loop_interval),
+        core_sender.clone(),
+        metrics.map(|m| m.sender.clone()),
+    );
+
+    let mut core_manager = CoreManager::new(limits, drive, hid_controller, websocket_server);
 
     loop {
-        let stroke_params = stroke_params.clone();
-        let last_response = last_response.clone();
-
-        let mut connection = match DriveConnection::new(&options, stroke_params, last_response) {
-            Ok(connection) => connection,
-            Err(e) => {
-                eprintln!("Failed to connect to drive: {e}");
-                std::thread::sleep(Duration::from_secs(1));
-                continue;
-            }
+        let message = match core_receiver.recv() {
+            Ok(message) => message,
+            Err(_) => break,
         };
 
-        if let Err(e) = connection.start_loop() {
-            eprintln!("Drive connection failed: {e}");
-        }
-
-        std::thread::sleep(Duration::from_secs(1));
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct StrokeParams {
-    enabled: bool,
-    stopped: bool,
-    start: Position,
-    end: Position,
-    direction_change_tolerance: Position,
-    forwards_velocity: Velocity,
-    forwards_acceleration: Acceleration,
-    forwards_deceleration: Acceleration,
-    backwards_velocity: Velocity,
-    backwards_acceleration: Acceleration,
-    backwards_deceleration: Acceleration,
-    jerk: Option<Jerk>,
-}
-
-impl StrokeParams {
-    const fn new() -> Self {
-        Self {
-            enabled: false,
-            stopped: false,
-            start: Position::from_millimeters(0),
-            end: Position::from_millimeters(0),
-            direction_change_tolerance: Position::from_millimeters(1),
-            forwards_velocity: Velocity::from_meters_per_second(1),
-            forwards_acceleration: Acceleration::from_meters_per_second_squared(1),
-            forwards_deceleration: Acceleration::from_meters_per_second_squared(1),
-            backwards_velocity: Velocity::from_meters_per_second(1),
-            backwards_acceleration: Acceleration::from_meters_per_second_squared(1),
-            backwards_deceleration: Acceleration::from_meters_per_second_squared(1),
-            jerk: None,
-        }
-    }
-}
-
-// TODO: This is for the USB HID API, consider implementing a more specific trait.
-impl WireRead for StrokeParams {
-    fn read_from(r: &mut Reader) -> Result<Self> {
-        let flags = r.read_u8()?;
-
-        Ok(Self {
-            enabled: (flags & 0x01) != 0,
-            stopped: (flags & 0x02) != 0,
-            start: Position::read_from(r)?,
-            end: Position::read_from(r)?,
-            direction_change_tolerance: Position::read_from(r)?,
-            forwards_velocity: Velocity::read_from(r)?,
-            forwards_acceleration: Acceleration::read_from(r)?,
-            forwards_deceleration: Acceleration::read_from(r)?,
-            backwards_velocity: Velocity::read_from(r)?,
-            backwards_acceleration: Acceleration::read_from(r)?,
-            backwards_deceleration: Acceleration::read_from(r)?,
-            jerk: None,
-        })
-    }
-}
-
-#[cfg(feature = "hidapi")]
-fn run_hidapi_loop(
-    options: &Options,
-    stroke_params: Arc<Mutex<StrokeParams>>,
-    last_response: Arc<Mutex<Option<Response>>>,
-) -> Result<()> {
-    use hidapi::HidApi;
-
-    let mut api = HidApi::new()?;
-
-    loop {
-        api.reset_devices()?;
-        api.add_devices(options.usb_vid, options.usb_pid)?;
-
-        if !api.device_list().any(|d| d.vendor_id() == options.usb_vid && d.product_id() == options.usb_pid) {
-            std::thread::sleep(Duration::from_secs(1));
-            continue;
-        }
-
-        if let Err(r) = run_hid_device_loop(&api, options, stroke_params.clone(), last_response.clone()) {
-            eprintln!("Error in USB HID device loop: {}", r);
-            std::thread::sleep(Duration::from_secs(1));
-            continue;
-        }
-    }
-}
-
-#[cfg(feature = "hidapi")]
-fn run_hid_device_loop(
-    api: &hidapi::HidApi,
-    options: &Options,
-    stroke_params: Arc<Mutex<StrokeParams>>,
-    last_response: Arc<Mutex<Option<Response>>>,
-) -> Result<()> {
-    let device = api.open(options.usb_vid, options.usb_pid)?;
-
-    println!("USB device connected: {:#?}", &device);
-
-    let feature_report: Vec<u8> = [0x01]
-        .into_iter()
-        .chain(Position::from_millimeters_f64(options.stroke_limit).0.to_le_bytes())
-        .chain(Velocity::from_meters_per_second_f64(options.velocity_limit).0.to_le_bytes())
-        .chain(Acceleration::from_meters_per_second_squared_f64(options.acceleration_limit).0.to_le_bytes())
-        .collect();
-
-    device.send_feature_report(&feature_report)?;
-
-    let mut buffer = [0u8; 64];
-
-    loop {
-        let response_report: Vec<u8> = {
-            let last_response = last_response.lock().unwrap();
-
-            match last_response.as_ref() {
-                Some(Response {
-                    status_flags: Some(status_flags),
-                    state: Some(state),
-                    actual_position: Some(actual_position),
-                    demand_position: Some(demand_position),
-                    current: Some(current),
-                    warning_flags: Some(warning_flags),
-                    error_code: Some(error_code),
-                    ..
-                }) => [0x01, 0x01]
-                    .into_iter()
-                    .chain(status_flags.bits().to_le_bytes())
-                    .chain(u16::to_le_bytes((*state).into()))
-                    .chain(actual_position.0.to_le_bytes())
-                    .chain(demand_position.0.to_le_bytes())
-                    .chain(current.0.to_le_bytes())
-                    .chain(warning_flags.bits().to_le_bytes())
-                    .chain(u16::to_le_bytes((*error_code).into()))
-                    .collect(),
-                _ => {
-                    vec![0x01, 0x00]
-                }
-            }
-        };
-
-        device.write(&response_report)?;
-
-        // Use a timeout so we write the params even if we're not getting any data.
-        let read_count = device.read_timeout(&mut buffer, 1000)?;
-        if read_count == 0 {
-            continue;
-        }
-
-        // println!("USB HID: {:02x?}", &buffer[..read_count]);
-
-        let mut reader = Reader::new(&buffer);
-
-        let report_id = reader.read_u8()?;
-        if report_id != 1 {
-            continue;
-        }
-
-        let new_stroke_params = StrokeParams::read_from(&mut reader)?;
-
-        {
-            let mut stroke_params = stroke_params.lock().unwrap();
-
-            if *stroke_params == new_stroke_params {
-                continue;
-            }
-
-            // println!("{:#?}", new_stroke_params);
-
-            // TODO: We may also want to sync the local params back to the USB device.
-            *stroke_params = new_stroke_params;
-        }
-    }
-}
-
-fn run_input_loop(stroke_params: Arc<Mutex<StrokeParams>>) {
-    let mut input = String::new();
-
-    loop {
-        input.clear();
-        let bytes_read = std::io::stdin().read_line(&mut input).unwrap();
-        if bytes_read == 0 {
-            // If no bytes were read, we've hit EOF.
-            break;
-        }
-
-        let (command, value) = match input.split_once(' ') {
-            Some((command, value)) => (command, value.trim_end().parse().ok()),
-            None => (input.trim_end(), None),
-        };
-
-        let mut stroke_params = stroke_params.lock().unwrap();
-
-        match (command, value) {
-            ("h", _) => {
-                println!("Available commands:");
-                println!("   p = Toggle power (hard stop)");
-                println!("   f = Toggle soft stop");
-                println!("   r = Reset parameters to default");
-                println!("   s = Set stroke start position in mm");
-                println!("   e = Set stroke start position in mm");
-                println!("  sl = Set stroke length in mm");
-                println!("  el = Set stroke length in mm");
-                println!("   t = Set direction change tolerance in mm");
-                println!("   v = Set velocity in m/s");
-                println!("   a = Set acceleration in m/s²");
-                println!("   j = Set jerk in m/s³");
-                println!("  fv = Set forwards velocity in m/s");
-                println!("  fa = Set forwards acceleration in m/s²");
-                println!("  fd = Set forwards deceleration in m/s²");
-                println!("  bv = Set backwards velocity in m/s");
-                println!("  ba = Set backwards acceleration in m/s²");
-                println!("  bd = Set backwards deceleration in m/s²");
-            }
-            ("p", _) => {
-                stroke_params.enabled = !stroke_params.enabled;
-            }
-            ("f", _) => {
-                stroke_params.stopped = !stroke_params.stopped;
-            }
-            ("r", _) => {
-                *stroke_params = StrokeParams {
-                    enabled: stroke_params.enabled,
-                    stopped: stroke_params.stopped,
-                    ..StrokeParams::new()
-                }
-            }
-            ("s", Some(v)) => stroke_params.start = Position::from_millimeters_f64(v),
-            ("e", Some(v)) => stroke_params.end = Position::from_millimeters_f64(v),
-            ("sl", Some(v)) => stroke_params.end = stroke_params.start + Position::from_millimeters_f64(v),
-            ("el", Some(v)) => stroke_params.start = stroke_params.end - Position::from_millimeters_f64(v),
-            ("t", Some(v)) => stroke_params.direction_change_tolerance = Position::from_millimeters_f64(v),
-            ("v", Some(v)) => {
-                stroke_params.forwards_velocity = Velocity::from_meters_per_second_f64(v);
-                stroke_params.backwards_velocity = stroke_params.forwards_velocity;
-            }
-            ("a", Some(v)) => {
-                stroke_params.forwards_acceleration = Acceleration::from_meters_per_second_squared_f64(v);
-                stroke_params.forwards_deceleration = stroke_params.forwards_acceleration;
-                stroke_params.backwards_acceleration = stroke_params.forwards_acceleration;
-                stroke_params.backwards_deceleration = stroke_params.backwards_acceleration;
-            }
-            ("j", Some(v)) => {
-                if v > 0.0 {
-                    stroke_params.jerk = Some(Jerk::from_meters_per_second_cubed_f64(v));
-                } else {
-                    stroke_params.jerk = None;
-                }
-            }
-            ("fv", Some(v)) => stroke_params.forwards_velocity = Velocity::from_meters_per_second_f64(v),
-            ("fa", Some(v)) => {
-                stroke_params.forwards_acceleration = Acceleration::from_meters_per_second_squared_f64(v)
-            }
-            ("fd", Some(v)) => {
-                stroke_params.forwards_deceleration = Acceleration::from_meters_per_second_squared_f64(v)
-            }
-            ("bv", Some(v)) => stroke_params.backwards_velocity = Velocity::from_meters_per_second_f64(v),
-            ("ba", Some(v)) => {
-                stroke_params.backwards_acceleration = Acceleration::from_meters_per_second_squared_f64(v)
-            }
-            ("bd", Some(v)) => {
-                stroke_params.backwards_deceleration = Acceleration::from_meters_per_second_squared_f64(v)
-            }
-            _ => {
-                println!("Unknown command or missing value, use 'h' for help");
-                continue;
-            }
-        }
-
-        println!("{:#?}", *stroke_params);
-    }
-}
-
-struct StrokeLimits {
-    stroke_limit: Position,
-    velocity_limit: Velocity,
-    acceleration_limit: Acceleration,
-    jerk_limit: Jerk,
-}
-
-struct DriveConnection {
-    socket: UdpSocket,
-    loop_interval: Duration,
-    report_interval: Duration,
-    buffer: [u8; BUFFER_SIZE],
-    last_response: Arc<Mutex<Option<Response>>>,
-    last_state: State,
-    control_flags: ControlFlags,
-    acknowledge_error: bool,
-    moving_forwards: bool,
-    in_range: bool,
-    stroke_limits: StrokeLimits,
-    stroke_params: Arc<Mutex<StrokeParams>>,
-    #[cfg(feature = "questdb-rs")]
-    metrics: Option<DriveMetrics>,
-}
-
-impl DriveConnection {
-    fn new(
-        options: &Options,
-        stroke_params: Arc<Mutex<StrokeParams>>,
-        last_response: Arc<Mutex<Option<Response>>>,
-    ) -> Result<Self> {
-        println!("Connecting to drive at {}:{}...", options.drive_address, DRIVE_PORT);
-
-        let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, CONTROLLER_PORT))?;
-
-        socket.connect((options.drive_address.as_str(), DRIVE_PORT))?;
-
-        let loop_interval = Duration::from_millis(options.loop_interval);
-        socket.set_read_timeout(Some(loop_interval * 10))?;
-
-        let mut buffer = [0u8; BUFFER_SIZE];
-
-        // Send a packet to check the drive is responding.
-        {
-            let request = Request::default();
-            let to_send = request.to_wire(&mut buffer).context("Failed to serialize request")?;
-            socket.send(&buffer[..to_send])?;
-
-            let received = socket.recv(&mut buffer)?;
-            let _response = Response::from_wire(&buffer[..received])?;
-        }
-
-        println!("Connected to drive at {:?} from {:?}", socket.peer_addr().unwrap(), socket.local_addr().unwrap());
-
-        Ok(Self {
-            socket,
-            loop_interval,
-            report_interval: Duration::from_millis(options.report_interval),
-            buffer,
-            last_response,
-            last_state: State::NotReadyToSwitchOn,
-            control_flags: ControlFlags::empty(),
-            acknowledge_error: true,
-            moving_forwards: false,
-            in_range: false,
-            stroke_limits: StrokeLimits {
-                stroke_limit: Position::from_millimeters_f64(options.stroke_limit),
-                velocity_limit: Velocity::from_meters_per_second_f64(options.velocity_limit),
-                acceleration_limit: Acceleration::from_meters_per_second_squared_f64(options.acceleration_limit),
-                jerk_limit: Jerk::from_meters_per_second_cubed_f64(options.jerk_limit),
-            },
-            stroke_params,
-            #[cfg(feature = "questdb-rs")]
-            metrics: None,
-        })
+        core_manager.handle_event(message)?;
     }
 
-    fn get_motion_command_for_stroke_params(
-        limits: &StrokeLimits,
-        params: &StrokeParams,
-        moving_forwards: &mut bool,
-        demand_position: &Position,
-        in_range: &mut bool,
-        demand_velocity: &Velocity,
-    ) -> Command {
-        let start_position = params.start.min(limits.stroke_limit);
-        let end_position = params.end.min(limits.stroke_limit);
-
-        // TODO: There's an issue with the motor overshooting if deceleration is reduced during active deceleration.
-        //       Until we can rework the control loop, work around it by stopping on overshoot, to let our next command correct it.
-        // TODO: We're still seeing occasional overshoots with this, we're going to need to model the VAI completely.
-        if *in_range {
-            if *demand_velocity > Velocity::from_meters_per_second(0) {
-                if *demand_position >= end_position + params.direction_change_tolerance {
-                    *in_range = false;
-                    *moving_forwards = false;
-                    return Command::VaiStop { deceleration: Acceleration::from_meters_per_second_squared(10) };
-                }
-            } else {
-                if *demand_position <= start_position - params.direction_change_tolerance {
-                    *in_range = false;
-                    *moving_forwards = true;
-                    return Command::VaiStop { deceleration: Acceleration::from_meters_per_second_squared(10) };
-                }
-            }
-        } else if *demand_position >= start_position && *demand_position <= end_position {
-            *in_range = true;
-        }
-
-        if *moving_forwards {
-            if params.stopped {
-                return Command::VaiStop { deceleration: params.forwards_deceleration.min(limits.acceleration_limit) };
-            }
-
-            if *demand_position >= end_position - params.direction_change_tolerance {
-                *moving_forwards = false;
-            }
-
-            if let Some(jerk) = params.jerk {
-                Command::VajiGoToPos {
-                    target_position: end_position,
-                    maximal_velocity: params.forwards_velocity.min(limits.velocity_limit),
-                    maximal_acceleration: params.forwards_acceleration.min(limits.acceleration_limit),
-                    maximal_deceleration: params.forwards_deceleration.min(limits.acceleration_limit),
-                    jerk: jerk.min(limits.jerk_limit),
-                }
-            } else {
-                Command::VaiGoToPos {
-                    target_position: end_position,
-                    maximal_velocity: params.forwards_velocity.min(limits.velocity_limit),
-                    acceleration: params.forwards_acceleration.min(limits.acceleration_limit),
-                    deceleration: params.forwards_deceleration.min(limits.acceleration_limit),
-                }
-            }
-        } else {
-            if params.stopped {
-                return Command::VaiStop { deceleration: params.backwards_deceleration.min(limits.acceleration_limit) };
-            }
-
-            if *demand_position <= start_position + params.direction_change_tolerance {
-                *moving_forwards = true;
-            }
-
-            if let Some(jerk) = params.jerk {
-                Command::VajiGoToPos {
-                    target_position: start_position,
-                    maximal_velocity: params.backwards_velocity.min(limits.velocity_limit),
-                    maximal_acceleration: params.backwards_acceleration.min(limits.acceleration_limit),
-                    maximal_deceleration: params.backwards_deceleration.min(limits.acceleration_limit),
-                    jerk: jerk.min(limits.jerk_limit),
-                }
-            } else {
-                Command::VaiGoToPos {
-                    target_position: start_position,
-                    maximal_velocity: params.backwards_velocity.min(limits.velocity_limit),
-                    acceleration: params.backwards_acceleration.min(limits.acceleration_limit),
-                    deceleration: params.backwards_deceleration.min(limits.acceleration_limit),
-                }
-            }
-        }
-    }
-
-    fn loop_tick(&mut self) -> Result<()> {
-        let mut request = Request {
-            response_flags: ResponseFlags::STATUS_FLAGS
-                | ResponseFlags::STATE
-                | ResponseFlags::ACTUAL_POSITION
-                | ResponseFlags::DEMAND_POSITION
-                | ResponseFlags::CURRENT
-                | ResponseFlags::WARNING_FLAGS
-                | ResponseFlags::ERROR_CODE
-                | ResponseFlags::MONITORING_CHANNEL,
-            ..Default::default()
-        };
-
-        let last_response = { self.last_response.lock().unwrap().clone() };
-
-        // TODO: We currently have several control bits forced in the parameter configuration,
-        //       re-evaluate if we want to implement the full state machine instead.
-        if let Some(Response {
-            state: Some(state),
-            demand_position: Some(demand_position),
-            monitoring_channel: Some((demand_velocity, ..)),
-            ..
-        }) = last_response.as_ref()
-        {
-            if *state != self.last_state {
-                // TODO: Figure out how to ignore OperationEnabled->OperationEnabled transitions if only motion_command_count changed.
-                // println!("Transitioned from {:?} to {:?}", self.last_state, state);
-                self.last_state = *state;
-            }
-
-            match state {
-                State::NotReadyToSwitchOn => {
-                    self.control_flags = ControlFlags::empty();
-                }
-                State::ReadyToSwitchOn => {
-                    // We only acknowledge an error once on startup to get the drive into a stable state.
-                    // Require user confirmation before acknowledging any drive errors during operation.
-                    self.acknowledge_error = false;
-
-                    let stroke_params = self.stroke_params.lock().unwrap();
-
-                    if stroke_params.enabled {
-                        self.control_flags = ControlFlags::SWITCH_ON;
-                    }
-                }
-                State::Error { error_code } if self.acknowledge_error => {
-                    println!("Acknowledging error: {error_code:?}");
-
-                    // TODO: Clearing a fatal error (e.g. slider missing) requires a drive reset.
-                    self.control_flags = ControlFlags::ERROR_ACKNOWLEDGE;
-                }
-                State::OperationEnabled { homed: false, .. } => {
-                    self.control_flags.insert(ControlFlags::HOME);
-                }
-                State::OperationEnabled { homed: true, motion_command_count, .. } => {
-                    let next_command_count = (motion_command_count.wrapping_add(1)) & 0xF;
-
-                    let stroke_params = self.stroke_params.lock().unwrap();
-
-                    if !stroke_params.enabled {
-                        self.control_flags.remove(ControlFlags::SWITCH_ON);
-                    } else {
-                        let command = Self::get_motion_command_for_stroke_params(
-                            &self.stroke_limits,
-                            &stroke_params,
-                            &mut self.moving_forwards,
-                            demand_position,
-                            &mut self.in_range,
-                            &Velocity(i32::from_ne_bytes(demand_velocity.to_ne_bytes())),
-                        );
-
-                        request.motion_command = Some(MotionCommand { count: next_command_count, command });
-                    }
-                }
-                State::Homing { finished: true } => {
-                    self.control_flags.remove(ControlFlags::HOME);
-                }
-                _ => {}
-            }
-        }
-
-        request.control_flags = Some(self.control_flags);
-
-        let to_send = request.to_wire(&mut self.buffer).context("Failed to serialize request")?;
-
-        self.socket.send(&self.buffer[..to_send])?;
-
-        let received = self.socket.recv(&mut self.buffer)?;
-
-        // TODO: Extend this error type to include the raw bytes that were received
-        let response = Response::from_wire(&self.buffer[..received])?;
-
-        #[cfg(feature = "questdb-rs")]
-        if let Some(metrics) = &mut self.metrics {
-            if let Err(error) = metrics.record(&request, &response) {
-                eprintln!("Failed to record metrics: {error}");
-                self.metrics = None;
-            }
-        }
-
-        {
-            *self.last_response.lock().unwrap() = Some(response);
-        }
-
-        Ok(())
-    }
-
-    fn start_loop(&mut self) -> Result<()> {
-        let mut last_loop_report = Instant::now();
-        let mut loop_duration_sum = Duration::ZERO;
-        let mut loop_duration_min = Duration::MAX;
-        let mut loop_duration_max = Duration::ZERO;
-        let mut loop_message_count: usize = 0;
-        let mut loop_error_history = Vec::new();
-
-        let mut next_tick = Instant::now() + self.loop_interval;
-
-        loop {
-            let iter_start = Instant::now();
-
-            if let Err(error) = self.loop_tick() {
-                // TODO: Print the error if it's not just a read timeout
-                loop_error_history.push(error);
-            }
-
-            loop_message_count += 1;
-
-            let loop_duration = iter_start.elapsed();
-            loop_duration_sum += loop_duration;
-            loop_duration_min = loop_duration_min.min(loop_duration);
-            loop_duration_max = loop_duration_max.max(loop_duration);
-
-            if last_loop_report.elapsed() >= self.report_interval {
-                // println!();
-
-                // Attempt to reconnect the metrics reporter periodically.
-                if self.metrics.is_none() {
-                    self.metrics = match DriveMetrics::new((1000 / self.loop_interval.as_millis()) as usize) {
-                        Ok(metrics) => {
-                            eprintln!("Connected to metrics reporter");
-                            Some(metrics)
-                        }
-                        Err(e) => {
-                            eprintln!("Failed to connect to metrics reporter: {e}");
-                            None
-                        }
-                    };
-                }
-
-                // TODO: Print the error history in a compact format
-                let avg_loop_duration = loop_duration_sum / (loop_message_count as u32);
-                println!(
-                    "Timing statistics: {:?} average, {:?} min, {:?} max, {:.2}% usage ({:.2}% peak), {}/{} errors",
-                    avg_loop_duration,
-                    loop_duration_min,
-                    loop_duration_max,
-                    (avg_loop_duration.as_secs_f64() / self.loop_interval.as_secs_f64()) * 100.0,
-                    (loop_duration_max.as_secs_f64() / self.loop_interval.as_secs_f64()) * 100.0,
-                    loop_error_history.len(),
-                    loop_message_count,
-                );
-
-                self.print_drive_status();
-
-                // {
-                //     let stroke_params = self.stroke_params.lock().unwrap();
-                //     println!("{:#?}", *stroke_params);
-                // }
-
-                if !loop_error_history.is_empty() && loop_error_history.len() == loop_message_count {
-                    break Err(anyhow!("Too many errors in loop, aborting"));
-                }
-
-                last_loop_report = Instant::now();
-                loop_duration_sum = Duration::ZERO;
-                loop_duration_min = Duration::MAX;
-                loop_duration_max = Duration::ZERO;
-                loop_message_count = 0;
-                loop_error_history.clear();
-            }
-
-            // Sleep until the next tick; if overrun, report lateness and realign to the next interval boundary
-            let now = Instant::now();
-            if let Some(remaining) = next_tick.checked_duration_since(now) {
-                std::thread::sleep(remaining);
-                next_tick += self.loop_interval;
-            } else {
-                let late_by = now.duration_since(next_tick);
-                eprintln!("Late by {late_by:?}");
-                next_tick = now + self.loop_interval;
-            }
-        }
-    }
-
-    fn print_drive_status(&self) {
-        let last_response = self.last_response.lock().unwrap();
-        let Some(response) = last_response.as_ref() else {
-            return;
-        };
-
-        if let (Some(status_flags), Some(state)) = (&response.status_flags, &response.state) {
-            println!("State: {state:?}, Status: {status_flags:?}");
-        }
-
-        if let (Some(actual_position), Some(demand_position), Some(current)) =
-            (&response.actual_position, &response.demand_position, &response.current)
-        {
-            println!("Actual Pos.: {actual_position:?}, Desired Pos.: {demand_position:?}, Current: {current:?}");
-        }
-
-        if let (Some(warning_flags), Some(error_code)) = (&response.warning_flags, &response.error_code) {
-            if !warning_flags.is_empty() || *error_code != ErrorCode::NoError {
-                println!("Warnings: {warning_flags:?}, Error: {error_code:?}");
-            }
-        }
-    }
-}
-
-#[cfg(feature = "questdb-rs")]
-struct DriveMetrics {
-    flush_count: usize,
-    sender: Sender,
-    buffer: Buffer,
-}
-
-#[cfg(feature = "questdb-rs")]
-impl DriveMetrics {
-    fn new(flush_count: usize) -> Result<Self> {
-        let sender = Sender::from_env()?;
-        let buffer = sender.new_buffer();
-
-        Ok(Self { flush_count, sender, buffer })
-    }
-
-    fn record(&mut self, request: &Request, response: &Response) -> Result<()> {
-        if self.sender.must_close() {
-            return Err(anyhow!("Metrics sender must close"));
-        }
-
-        self.buffer.table("linmot_stats").unwrap();
-
-        if let Some(control_flags) = request.control_flags {
-            self.buffer.column_i64("control_flags", control_flags.bits() as i64).unwrap();
-        }
-
-        if let Some(motion_command) = &request.motion_command {
-            self.buffer.column_i64("motion_command_id", motion_command.command.id() as i64).unwrap();
-
-            if let Command::VaiGoToPos { target_position, .. } | Command::VajiGoToPos { target_position, .. } =
-                &motion_command.command
-            {
-                self.buffer.column_f64("target_position", target_position.0 as f64).unwrap();
-            }
-        }
-
-        // TODO: Consider packing status_flags+state+warning_flags+error_code into a single column
-        // TODO: Instead, pre-create the table on the QuestDB side to specify smaller storage data types
-
-        if let Some(status_flags) = response.status_flags {
-            self.buffer.column_i64("status_flags", status_flags.bits() as i64).unwrap();
-        }
-
-        if let Some(state) = response.state {
-            self.buffer.column_i64("state", u16::from(state) as i64).unwrap();
-        }
-
-        if let Some(actual_position) = response.actual_position {
-            self.buffer.column_i64("actual_position", actual_position.0 as i64).unwrap();
-        }
-
-        if let Some(demand_position) = response.demand_position {
-            self.buffer.column_i64("demand_position", demand_position.0 as i64).unwrap();
-        }
-
-        if let Some(current) = response.current {
-            self.buffer.column_i64("current", current.0 as i64).unwrap();
-        }
-
-        if let Some(warning_flags) = response.warning_flags {
-            self.buffer.column_i64("warning_flags", warning_flags.bits() as i64).unwrap();
-        }
-
-        if let Some(error_code) = response.error_code {
-            self.buffer.column_i64("error_code", u16::from(error_code) as i64).unwrap();
-        }
-
-        // TODO: Get the current config during startup to verify these are setup correctly in the drive.
-        if let Some((a, b, c, d)) = response.monitoring_channel {
-            let demand_velocity = i32::from_ne_bytes(a.to_ne_bytes());
-            self.buffer.column_i64("demand_velocity", demand_velocity as i64).unwrap();
-            let demand_acceleration = i32::from_ne_bytes(b.to_ne_bytes());
-            self.buffer.column_i64("demand_acceleration", demand_acceleration as i64).unwrap();
-            let drive_temp = c as u16;
-            self.buffer.column_i64("drive_temp", drive_temp as i64).unwrap();
-            let motor_temp = d as u16;
-            self.buffer.column_i64("motor_temp", motor_temp as i64).unwrap();
-        }
-
-        self.buffer.at(TimestampMicros::now()).unwrap();
-
-        if self.buffer.row_count() >= self.flush_count {
-            // TODO: We may want to move flushing to a separate thread, which'll involve moving this entire struct.
-            // TODO: Figure out our error handling needs here.
-            self.sender.flush(&mut self.buffer)?;
-        }
-
-        Ok(())
-    }
+    Ok(())
 }

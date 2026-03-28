@@ -1,4 +1,22 @@
-use anyhow::{Result, anyhow};
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ReadError {
+    Underflow { needed: usize, have: usize },
+}
+
+impl std::fmt::Display for ReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadError::Underflow { needed, have } => {
+                write!(f, "buffer underflow while parsing (needed {needed}, have {have})")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReadError {}
+
+type Result<T> = std::result::Result<T, ReadError>;
 
 /// Simple cursor-based little-endian reader with bounds checking
 pub struct Reader<'a> {
@@ -13,11 +31,7 @@ impl<'a> Reader<'a> {
 
     fn read_bytes(&mut self, n: usize) -> Result<&'a [u8]> {
         if self.idx + n > self.buf.len() {
-            return Err(anyhow!(
-                "buffer underflow while parsing (needed {}, have {})",
-                n,
-                self.buf.len().saturating_sub(self.idx)
-            ));
+            return Err(ReadError::Underflow { needed: n, have: self.buf.len().saturating_sub(self.idx) });
         }
 
         let s = &self.buf[self.idx..self.idx + n];

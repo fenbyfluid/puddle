@@ -1,6 +1,5 @@
-use crate::reader::{Reader, WireRead};
-use crate::writer::{WireWrite, Writer};
-use anyhow::Result;
+use crate::udp::reader::{ReadError, Reader, WireRead};
+use crate::udp::writer::{WireWrite, WriteError, Writer};
 use core::fmt;
 use std::ops;
 
@@ -41,11 +40,59 @@ macro_rules! impl_std_ops {
                 self.0 -= rhs.0;
             }
         }
+
+        impl ops::Mul for $type {
+            type Output = Self;
+
+            fn mul(self, rhs: Self) -> Self {
+                Self(self.0 * rhs.0)
+            }
+        }
+
+        impl ops::MulAssign for $type {
+            fn mul_assign(&mut self, rhs: Self) {
+                self.0 *= rhs.0;
+            }
+        }
+
+        impl ops::Div for $type {
+            type Output = Self;
+
+            fn div(self, rhs: Self) -> Self {
+                Self(self.0 / rhs.0)
+            }
+        }
+
+        impl ops::DivAssign for $type {
+            fn div_assign(&mut self, rhs: Self) {
+                self.0 /= rhs.0;
+            }
+        }
+
+        #[cfg(feature = "serde")]
+        impl serde_core::Serialize for $type {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde_core::Serializer,
+            {
+                self.0.serialize(serializer)
+            }
+        }
+
+        #[cfg(feature = "serde")]
+        impl<'de> serde_core::Deserialize<'de> for $type {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde_core::Deserializer<'de>,
+            {
+                serde_core::Deserialize::deserialize(deserializer).map(Self)
+            }
+        }
     };
 }
 
 /// Position in units of 0.1 μm
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Position(pub i32);
 
 impl Position {
@@ -61,13 +108,13 @@ impl Position {
 }
 
 impl WireRead for Position {
-    fn read_from(r: &mut Reader) -> Result<Self> {
+    fn read_from(r: &mut Reader) -> Result<Self, ReadError> {
         Ok(Self(i32::read_from(r)?))
     }
 }
 
 impl WireWrite for Position {
-    fn write_to(&self, w: &mut Writer) -> Result<()> {
+    fn write_to(&self, w: &mut Writer) -> Result<(), WriteError> {
         self.0.write_to(w)
     }
 }
@@ -83,18 +130,18 @@ impl fmt::Debug for Position {
 impl_std_ops!(Position);
 
 /// Velocity in units of 1e-6 m/s (1 μm/s)
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Velocity(pub i32);
 
 impl Velocity {
     #[must_use]
     pub const fn from_millimeters_per_second(mm_per_s: i32) -> Self {
-        Self(mm_per_s * 10_000)
+        Self(mm_per_s * 1_000)
     }
 
     #[must_use]
     pub const fn from_millimeters_per_second_f64(mm_per_s: f64) -> Self {
-        Self((mm_per_s * 10_000f64) as i32)
+        Self((mm_per_s * 1_000f64) as i32)
     }
 
     #[must_use]
@@ -109,13 +156,13 @@ impl Velocity {
 }
 
 impl WireRead for Velocity {
-    fn read_from(r: &mut Reader) -> Result<Self> {
+    fn read_from(r: &mut Reader) -> Result<Self, ReadError> {
         Ok(Self(i32::read_from(r)?))
     }
 }
 
 impl WireWrite for Velocity {
-    fn write_to(&self, w: &mut Writer) -> Result<()> {
+    fn write_to(&self, w: &mut Writer) -> Result<(), WriteError> {
         self.0.write_to(w)
     }
 }
@@ -130,8 +177,8 @@ impl fmt::Debug for Velocity {
 
 impl_std_ops!(Velocity);
 
-/// Acceleration in units of 1e-5 m/s^2 (10 μm/s^2)
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// Acceleration in units of 1e-5 m/s² (10 μm/s²)
+#[derive(Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Acceleration(pub i32);
 
 impl Acceleration {
@@ -157,13 +204,13 @@ impl Acceleration {
 }
 
 impl WireRead for Acceleration {
-    fn read_from(r: &mut Reader) -> Result<Self> {
+    fn read_from(r: &mut Reader) -> Result<Self, ReadError> {
         Ok(Self(i32::read_from(r)?))
     }
 }
 
 impl WireWrite for Acceleration {
-    fn write_to(&self, w: &mut Writer) -> Result<()> {
+    fn write_to(&self, w: &mut Writer) -> Result<(), WriteError> {
         self.0.write_to(w)
     }
 }
@@ -178,8 +225,8 @@ impl fmt::Debug for Acceleration {
 
 impl_std_ops!(Acceleration);
 
-/// Jerk in units of 1e-4 m/s^3 (100 μm/s^3)
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// Jerk in units of 1e-4 m/s³ (100 μm/s³)
+#[derive(Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Jerk(pub i32);
 
 impl Jerk {
@@ -205,7 +252,7 @@ impl Jerk {
 }
 
 impl WireWrite for Jerk {
-    fn write_to(&self, w: &mut Writer) -> Result<()> {
+    fn write_to(&self, w: &mut Writer) -> Result<(), WriteError> {
         self.0.write_to(w)
     }
 }
@@ -221,11 +268,11 @@ impl fmt::Debug for Jerk {
 impl_std_ops!(Jerk);
 
 /// Current in units of 1 mA
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Current(pub i16);
 
 impl WireRead for Current {
-    fn read_from(r: &mut Reader) -> Result<Self> {
+    fn read_from(r: &mut Reader) -> Result<Self, ReadError> {
         Ok(Self(i16::read_from(r)?))
     }
 }
@@ -240,6 +287,32 @@ impl fmt::Debug for Current {
 }
 
 impl_std_ops!(Current);
+
+/// Temperature in units of 0.1 degrees C
+#[derive(Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DriveTemperature(pub i16);
+
+impl fmt::Debug for DriveTemperature {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let degrees = f64::from(self.0) / 10.0;
+        fmt_scaled(f, degrees, &[("°C", 1.0)])
+    }
+}
+
+impl_std_ops!(DriveTemperature);
+
+/// Temperature in units of 50/51 (~0.98) degrees C with a -50 offset
+#[derive(Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MotorTemperature(pub i16);
+
+impl fmt::Debug for MotorTemperature {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let degrees = -50.0 + (f64::from(self.0) * (50.0 / 51.0));
+        fmt_scaled(f, degrees, &[("°C", 1.0)])
+    }
+}
+
+impl_std_ops!(MotorTemperature);
 
 fn fmt_scaled(f: &mut fmt::Formatter<'_>, value: f64, units: &[(&str, f64)]) -> fmt::Result {
     // Pick the first unit whose scaled absolute value is >= 1, or the last unit.
@@ -286,8 +359,8 @@ mod tests {
 
     #[test]
     fn test_velocity_conversions() {
-        assert_eq!(Velocity::from_millimeters_per_second(1), Velocity(10_000));
-        assert_eq!(Velocity::from_millimeters_per_second_f64(0.1), Velocity(1_000));
+        assert_eq!(Velocity::from_millimeters_per_second(1), Velocity(1_000));
+        assert_eq!(Velocity::from_millimeters_per_second_f64(0.1), Velocity(100));
         assert_eq!(Velocity::from_meters_per_second(1), Velocity(1_000_000));
         assert_eq!(Velocity::from_meters_per_second_f64(0.5), Velocity(500_000));
     }
@@ -355,5 +428,36 @@ mod tests {
         assert_eq!(format!("{:?}", Current(500)), "500mA");
         assert_eq!(format!("{:?}", Current(-500)), "-500mA");
         assert_eq!(format!("{:?}", Current(1000)), "1A");
+    }
+
+    #[test]
+    fn test_debug_format_drive_temperature() {
+        assert_eq!(format!("{:?}", DriveTemperature(0)), "0°C");
+        assert_eq!(format!("{:?}", DriveTemperature(330)), "33°C");
+        assert_eq!(format!("{:?}", DriveTemperature(335)), "33.5°C");
+    }
+
+    #[test]
+    fn test_debug_format_motor_temperature() {
+        assert_eq!(format!("{:?}", MotorTemperature(0)), "-50°C");
+        assert_eq!(format!("{:?}", MotorTemperature(72)), "20.588°C");
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn test_serde_round_trip() {
+        use serde_test::{Token, assert_tokens};
+
+        assert_tokens(&Position(123456), &[Token::I32(123456)]);
+        assert_tokens(&Velocity(654321), &[Token::I32(654321)]);
+        assert_tokens(&Acceleration(111), &[Token::I32(111)]);
+        assert_tokens(&Jerk(222), &[Token::I32(222)]);
+        assert_tokens(&Current(333), &[Token::I16(333)]);
+        assert_tokens(&DriveTemperature(444), &[Token::I16(444)]);
+        assert_tokens(&MotorTemperature(555), &[Token::I16(555)]);
+
+        // Test negative values
+        assert_tokens(&Position(-1), &[Token::I32(-1)]);
+        assert_tokens(&DriveTemperature(-10), &[Token::I16(-10)]);
     }
 }

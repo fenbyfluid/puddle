@@ -1,6 +1,4 @@
-use crate::reader::{Reader, WireRead};
-use crate::writer::{WireWrite, Writer};
-use anyhow::{Result, anyhow};
+use crate::udp::writer::{WireWrite, WriteError, Writer};
 use bitflags::bitflags;
 
 mod commands;
@@ -131,47 +129,9 @@ impl From<u16> for ErrorCode {
     }
 }
 
-// TODO: This is for the USB HID API, consider implementing a more specific trait.
-impl From<ErrorCode> for u16 {
-    fn from(val: ErrorCode) -> Self {
-        match val {
-            ErrorCode::NoError => 0x00,
-            ErrorCode::LogicSupplyTooLow => 0x01,
-            ErrorCode::LogicSupplyTooHigh => 0x02,
-            ErrorCode::MotorSupplyTooLow => 0x03,
-            ErrorCode::MotorSupplyTooHigh => 0x04,
-            ErrorCode::MinPositionUndershot => 0x07,
-            ErrorCode::MaxPositionOvershot => 0x08,
-            ErrorCode::PositionLagAlwaysTooBig => 0x0B,
-            ErrorCode::MotorHotSensor => 0x20,
-            ErrorCode::MotorSliderMissing => 0x22,
-            ErrorCode::MotorShortTimeOverload => 0x23,
-            ErrorCode::MotorCommunicationLost => 0x45,
-            ErrorCode::NotHomed => 0x80,
-            ErrorCode::UnknownMotionCommand => 0x81,
-            ErrorCode::PvtBufferOverflow => 0x82,
-            ErrorCode::PvtBufferUnderflow => 0x83,
-            ErrorCode::PvtControllerTooFast => 0x84,
-            ErrorCode::PvtControllerTooSlow => 0x85,
-            ErrorCode::MotionCommandInWrongState => 0x86,
-            ErrorCode::LessCalcTimeC0 => 0x90,
-            ErrorCode::LessCalcTimeC1 => 0x91,
-            ErrorCode::LessCalcTimeC2 => 0x92,
-            ErrorCode::LessCalcTimeC3 => 0x93,
-            ErrorCode::Unknown(e) => e,
-        }
-    }
-}
-
 impl From<u8> for ErrorCode {
     fn from(e: u8) -> Self {
         Self::from(u16::from(e))
-    }
-}
-
-impl WireRead for ErrorCode {
-    fn read_from(r: &mut Reader) -> Result<Self> {
-        Ok(u16::read_from(r)?.into())
     }
 }
 
@@ -227,12 +187,13 @@ pub enum State {
     },
 }
 
-impl WireRead for State {
-    fn read_from(r: &mut Reader) -> Result<Self> {
-        let sub_state = u8::read_from(r)?;
-        let main_state = u8::read_from(r)?;
+// TODO: Consider making this TryFrom and have an unknown state return an error.
+impl From<u16> for State {
+    fn from(val: u16) -> Self {
+        let sub_state = (val & 0xFF) as u8;
+        let main_state = (val >> 8) as u8;
 
-        Ok(match main_state {
+        match main_state {
             0 => Self::NotReadyToSwitchOn,
             1 => Self::SwitchOnDisabled,
             2 => Self::ReadyToSwitchOn,
@@ -261,63 +222,18 @@ impl WireRead for State {
             20 => Self::SpecialMode,
             21 => Self::BrakeDelay,
             _ => Self::Unknown { main_state, sub_state },
-        })
+        }
     }
 }
 
-// TODO: This is for the USB HID API, consider implementing a more specific trait.
-impl From<State> for u16 {
-    fn from(val: State) -> Self {
-        let (main, sub) = match val {
-            State::NotReadyToSwitchOn => (0, 0),
-            State::SwitchOnDisabled => (1, 0),
-            State::ReadyToSwitchOn => (2, 0),
-            State::SetupError { error_code } => (3, error_code.into()),
-            State::Error { error_code } => (4, error_code.into()),
-            State::HardwareTests => (5, 0),
-            State::ReadyToOperate => (6, 0),
-            State::OperationEnabled {
-                motion_command_count,
-                event_handler,
-                motion_active,
-                in_target_position,
-                homed,
-            } => (
-                8,
-                (if homed { 1 << 7 } else { 0 })
-                    | (if in_target_position { 1 << 6 } else { 0 })
-                    | (if motion_active { 1 << 5 } else { 0 })
-                    | (if event_handler { 1 << 4 } else { 0 })
-                    | (motion_command_count & 0xF) as u16,
-            ),
-            State::Homing { finished } => (9, if finished { 0xF } else { 0 }),
-            State::ClearanceCheck { finished } => (10, if finished { 0xF } else { 0 }),
-            State::GoingToInitialPosition { finished } => (11, if finished { 0xF } else { 0 }),
-            State::Aborting => (12, 0),
-            State::Freezing => (13, 0),
-            State::QuickStop => (14, 0),
-            State::GoingToPosition { finished } => (15, if finished { 0xF } else { 0 }),
-            State::JoggingPositive { finished } => (16, if finished { 0xF } else { 0 }),
-            State::JoggingNegative { finished } => (17, if finished { 0xF } else { 0 }),
-            State::Linearizing => (18, 0),
-            State::PhaseSearch => (19, 0),
-            State::SpecialMode => (20, 0),
-            State::BrakeDelay => (21, 0),
-            State::Unknown { main_state, sub_state } => (main_state as u16, sub_state as u16),
-        };
-
-        (main << 8) | (sub & 0xFF)
-    }
-}
-
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct MotionCommand {
     pub count: u8,
     pub command: Command,
 }
 
 impl WireWrite for MotionCommand {
-    fn write_to(&self, w: &mut Writer) -> Result<()> {
+    fn write_to(&self, w: &mut Writer) -> Result<(), WriteError> {
         let header = (self.command.id() << 4) | u16::from(self.count & 0xF);
 
         let before = w.pos();
@@ -326,16 +242,16 @@ impl WireWrite for MotionCommand {
         self.command.write_parameters(w)?;
 
         // Header + parameters must fit into 32 bytes
-        let len = w.pos() - before;
-        if len > 32 {
-            return Err(anyhow!("motion command parameters too large: {len} bytes (max 32)"));
+        let length = w.pos() - before;
+        if length > 32 {
+            return Err(WriteError::TooManyParameters { length });
         }
 
         // Pad the remainder of the 32-byte command block with zeros
-        let pad_len = 32 - len;
-        if pad_len > 0 {
+        let padding_length = 32 - length;
+        if padding_length > 0 {
             let zeros = [0u8; 32];
-            w.write_bytes(&zeros[..pad_len])?;
+            w.write_bytes(&zeros[..padding_length])?;
         }
 
         Ok(())
@@ -371,23 +287,5 @@ mod tests {
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
             ]
         );
-    }
-
-    #[test]
-    fn test_state_into() {
-        let state = State::OperationEnabled {
-            motion_command_count: 5,
-            event_handler: false,
-            motion_active: true,
-            in_target_position: false,
-            homed: true,
-        };
-
-        let state_bytes: u16 = state.into();
-
-        let buffer = state_bytes.to_le_bytes();
-        let mut reader = Reader::new(&buffer);
-
-        assert_eq!(State::read_from(&mut reader).unwrap(), state);
     }
 }

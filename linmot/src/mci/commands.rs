@@ -1,6 +1,5 @@
 use super::units::{Acceleration, Jerk, Position, Velocity};
-use crate::writer::{WireWrite, Writer};
-use anyhow::Result;
+use crate::udp::writer::{WireWrite, WriteError, Writer};
 
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -88,7 +87,7 @@ impl Command {
         }
     }
 
-    pub(super) fn write_parameters(&self, w: &mut Writer) -> Result<()> {
+    pub(super) fn write_parameters(&self, w: &mut Writer) -> Result<(), WriteError> {
         #[expect(clippy::match_same_arms)]
         match self {
             Self::NoOperation => {}

@@ -1,4 +1,26 @@
-use anyhow::{Result, anyhow};
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum WriteError {
+    Overflow { needed: usize, have: usize },
+    TooManyParameters { length: usize },
+}
+
+impl std::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WriteError::Overflow { needed, have } => {
+                write!(f, "buffer overflow while serializing (needed {needed}, have {have})")
+            }
+            WriteError::TooManyParameters { length } => {
+                write!(f, "motion command parameters too large: {length} bytes (max 32)")
+            }
+        }
+    }
+}
+
+impl std::error::Error for WriteError {}
+
+type Result<T> = std::result::Result<T, WriteError>;
 
 /// Bounded little-endian writer over a preallocated buffer.
 pub struct Writer<'a> {
@@ -23,7 +45,7 @@ impl<'a> Writer<'a> {
         let needed = bytes.len();
 
         if self.idx + needed > self.buf.len() {
-            return Err(anyhow!("buffer overflow while serializing (need {}, have {})", needed, self.remaining()));
+            return Err(WriteError::Overflow { needed, have: self.remaining() });
         }
 
         let end = self.idx + needed;
