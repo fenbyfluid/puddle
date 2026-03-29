@@ -78,6 +78,7 @@ impl ConnectionManager {
     pub fn new(
         address: String,
         interval: Duration,
+        overshoot_margin: Position,
         core_sender: mpsc::Sender<CoreEvent>,
         metrics_sender: Option<mpsc::Sender<Record>>,
     ) -> Self {
@@ -113,6 +114,7 @@ impl ConnectionManager {
                 let mut connection = match Connection::new(
                     &address,
                     interval,
+                    overshoot_margin,
                     core_sender.clone(),
                     metrics_sender.clone(),
                     connection_interface.clone(),
@@ -138,6 +140,7 @@ impl ConnectionManager {
 
 pub struct Connection {
     interval: Duration,
+    overshoot_margin: Position,
     core_sender: mpsc::Sender<CoreEvent>,
     metrics_sender: Option<mpsc::Sender<Record>>,
     interface: DriveInterface,
@@ -160,6 +163,7 @@ impl Connection {
     pub fn new(
         address: &str,
         interval: Duration,
+        overshoot_margin: Position,
         core_sender: mpsc::Sender<CoreEvent>,
         metrics_sender: Option<mpsc::Sender<Record>>,
         interface: DriveInterface,
@@ -173,6 +177,7 @@ impl Connection {
 
         let mut connection = Self {
             interval,
+            overshoot_margin,
             core_sender,
             metrics_sender,
             interface,
@@ -277,10 +282,7 @@ impl Connection {
             self.last_response.error_code(),
             self.last_response.monitoring_channel,
         ) {
-            if should_log_state_change(self.last_state, state) {
-                info!("Drive state changed: {:?} -> {:?}", self.last_state, state);
-                self.last_state = state;
-            }
+            log_state_change(&mut self.last_state, state);
 
             let feedback = DriveFeedback {
                 drive_state: match state {
@@ -384,7 +386,7 @@ impl Connection {
         // TODO: Where do we want to get this from?
         let hard_deceleration = Acceleration::from_meters_per_second_squared(5);
 
-        if !self.motion_enabled || self.input_commands.is_empty() {
+        if self.input_commands.is_empty() {
             self.next_motion_command = Some(MciMotionCommand {
                 count: next_command_count,
                 command: Command::VaiStop { deceleration: hard_deceleration },
@@ -421,11 +423,31 @@ impl Connection {
             input_command = self.input_commands.get(self.active_command_index).unwrap();
         }
 
+        if !self.motion_enabled {
+            let deceleration = clamp_deceleration(
+                demand_position,
+                demand_velocity,
+                input_command.position,
+                hard_deceleration,
+                self.overshoot_margin,
+            );
+
+            self.next_motion_command =
+                Some(MciMotionCommand { count: next_command_count, command: Command::VaiStop { deceleration } });
+
+            return Ok(());
+        }
+
         let deceleration = if target_reached {
             input_command.deceleration
         } else {
-            clamp_deceleration(demand_position, demand_velocity, input_command.position, input_command.deceleration)
-                .unwrap_or(hard_deceleration)
+            clamp_deceleration(
+                demand_position,
+                demand_velocity,
+                input_command.position,
+                input_command.deceleration,
+                self.overshoot_margin,
+            )
         };
 
         self.next_motion_command = Some(MciMotionCommand {
@@ -488,43 +510,64 @@ pub fn predict_position(
 ///
 /// If the requested deceleration is sufficient, returns it unchanged.
 /// Otherwise returns the minimum deceleration that stops at or before
-/// the target.
+/// the target + overshoot margin.
 ///
-/// Returns `None` if the target is already behind the current position
-/// (overshoot has already occurred, or remaining distance is zero with
-/// nonzero velocity). The caller must handle this (e.g., emergency stop
-/// or reversal).
+/// During direction reversals the demand velocity can briefly point away
+/// from the target while the VAI decelerates. We must NOT treat that as
+/// an overshoot — the drive is still on the correct side of the target.
+/// Use geometric direction (position relative to target) instead of
+/// velocity sign to decide.
+///
+/// We add the overshoot margin to the remaining distance so that the
+/// clamp only activates when the drive genuinely risks missing the
+/// target by more than the margin. Without this, the clamp computes
+/// stopping distance assuming the drive hasn't started decelerating yet,
+/// producing aggressive spikes near each waypoint because the VAI is
+/// already braking on its own.
 pub fn clamp_deceleration(
     actual_position: Position,
     velocity: Velocity,
     target_position: Position,
     requested_deceleration: Acceleration,
-) -> Option<Acceleration> {
+    overshoot_margin: Position,
+) -> Acceleration {
+    let displacement = target_position.0 as i64 - actual_position.0 as i64;
+
+    if displacement == 0 {
+        // Exactly at target — any deceleration is fine, the VAI
+        // will hold position.
+        return requested_deceleration;
+    }
+
+    // Determine the effective velocity component *toward* the
+    // target.  If the drive is moving away (velocity sign
+    // disagrees with displacement sign) the approach speed is
+    // zero — we don't need to brake for a target we're moving
+    // away from; the VAI will decelerate, reverse, and
+    // approach on its own.
     let v = velocity.0 as i64;
+    let approaching = (v > 0 && displacement > 0) || (v < 0 && displacement < 0);
 
-    if v == 0 {
-        return Some(requested_deceleration);
+    if !approaching || v == 0 {
+        // Moving away from target or stationary — no braking
+        // constraint needed.  Use the command's deceleration
+        // as-is and let the VAI handle the reversal.
+        return requested_deceleration;
     }
 
-    let pos = actual_position.0 as i64;
-    let target = target_position.0 as i64;
-
-    // Remaining distance in the direction of travel
-    let remaining = if v > 0 { target - pos } else { pos - target };
-
-    if remaining <= 0 {
-        return None;
-    }
-
-    let remaining = remaining as u64;
+    // Moving toward target — clamp deceleration so we can stop in time.
+    // Extend remaining distance by the overshoot margin.
+    // The VAI is already planning its own deceleration, so
+    // we only need to intervene if the stopping distance
+    // exceeds remaining + margin.
+    let remaining = displacement.unsigned_abs() + overshoot_margin.0.unsigned_abs() as u64;
     let v_abs = v.unsigned_abs();
-
-    // Stopping distance at requested deceleration: v² / (2d)
     let d = requested_deceleration.0 as i64;
+
     if d > 0 {
         let stopping_distance = v_abs * v_abs / (2 * d as u64);
         if stopping_distance <= remaining {
-            return Some(requested_deceleration);
+            return requested_deceleration;
         }
     }
 
@@ -532,30 +575,31 @@ pub fn clamp_deceleration(
     // Ceiling division to ensure we don't undershoot the deceleration
     let d_min = (v_abs * v_abs + 2 * remaining - 1) / (2 * remaining);
 
-    Some(Acceleration(d_min as i32))
+    Acceleration(d_min.min(i32::MAX as u64) as i32)
 }
 
-fn should_log_state_change(old_state: State, new_state: State) -> bool {
-    fn normalize_state(state: State) -> State {
-        match state {
-            State::OperationEnabled {
-                motion_command_count: _,
-                event_handler,
-                motion_active,
-                in_target_position,
-                homed,
-            } => State::OperationEnabled {
-                motion_command_count: 0,
-                event_handler,
-                motion_active,
-                in_target_position,
-                homed,
-            },
-            other => other,
+fn log_state_change(old_state: &mut State, new_state: State) {
+    fn normalized_eq(a: &State, b: &State) -> bool {
+        match (a, b) {
+            (State::OperationEnabled { homed: h1, .. }, State::OperationEnabled { homed: h2, .. }) => h1 == h2,
+            _ => a == b,
         }
     }
 
-    normalize_state(old_state) != normalize_state(new_state)
+    fn format_state(state: &State) -> String {
+        match state {
+            State::OperationEnabled { homed, .. } => {
+                format!("OperationEnabled {{ homed: {homed}, .. }}")
+            }
+            _ => format!("{state:?}"),
+        }
+    }
+
+    if !normalized_eq(old_state, &new_state) {
+        info!("Drive state changed: {} -> {}", format_state(old_state), format_state(&new_state));
+    }
+
+    *old_state = new_state;
 }
 
 #[cfg(test)]
@@ -645,8 +689,9 @@ mod tests {
             Velocity::from_meters_per_second(1),
             Position::from_millimeters(100),
             Acceleration::from_meters_per_second_squared(10),
+            Position::ZERO,
         );
-        assert_eq!(result, Some(Acceleration::from_meters_per_second_squared(10)));
+        assert_eq!(result, Acceleration::from_meters_per_second_squared(10));
     }
 
     #[test]
@@ -657,8 +702,9 @@ mod tests {
             Velocity::from_meters_per_second(1),
             Position::from_millimeters(100),
             Acceleration::from_meters_per_second_squared(5),
+            Position::ZERO,
         );
-        assert_eq!(result, Some(Acceleration::from_meters_per_second_squared(10)));
+        assert_eq!(result, Acceleration::from_meters_per_second_squared(10));
     }
 
     #[test]
@@ -669,18 +715,49 @@ mod tests {
             Velocity::from_meters_per_second(-1),
             Position::from_millimeters(50),
             Acceleration::from_meters_per_second_squared(5),
+            Position::ZERO,
         );
-        assert_eq!(result, Some(Acceleration::from_meters_per_second_squared(10)));
+        assert_eq!(result, Acceleration::from_meters_per_second_squared(10));
     }
 
     #[test]
-    fn past_target_returns_none() {
+    fn past_target_moving_away_returns_requested() {
+        // pos=110, target=100, v=1 -> moving away, no clamp
         let result = clamp_deceleration(
             Position::from_millimeters(110),
             Velocity::from_meters_per_second(1),
             Position::from_millimeters(100),
             Acceleration::from_meters_per_second_squared(10),
+            Position::ZERO,
         );
-        assert_eq!(result, None);
+        assert_eq!(result, Acceleration::from_meters_per_second_squared(10));
+    }
+
+    #[test]
+    fn overshoot_margin_avoids_clamp() {
+        // 1 m/s, 50mm remaining, 5 m/s² -> needs 100mm.
+        // If we have a 50mm overshoot margin, then total allowed distance is 100mm, so 5 m/s² is fine.
+        let result = clamp_deceleration(
+            Position::from_millimeters(50),
+            Velocity::from_meters_per_second(1),
+            Position::from_millimeters(100),
+            Acceleration::from_meters_per_second_squared(5),
+            Position::from_millimeters(50),
+        );
+        assert_eq!(result, Acceleration::from_meters_per_second_squared(5));
+    }
+
+    #[test]
+    fn direction_reversal_no_clamp() {
+        // Target is at 100, we are at 50, but velocity is -1 (moving away)
+        // This can happen during VAI reversals.
+        let result = clamp_deceleration(
+            Position::from_millimeters(50),
+            Velocity::from_meters_per_second(-1),
+            Position::from_millimeters(100),
+            Acceleration::from_meters_per_second_squared(10),
+            Position::ZERO,
+        );
+        assert_eq!(result, Acceleration::from_meters_per_second_squared(10));
     }
 }

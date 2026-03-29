@@ -283,7 +283,7 @@ mod tests {
         {
             let stream =
                 std::net::TcpStream::connect(format!("localhost:{}", server.port())).expect("Failed to connect");
-            let (mut socket, _) =
+            let (socket, _) =
                 tungstenite::client(format!("ws://localhost:{}", server.port()), stream).expect("Handshake failed");
 
             // Wait for Connected event

@@ -50,6 +50,9 @@ struct Options {
     /// Acceleration limit in meters per second squared
     #[clap(long, default_value = "15.0")]
     acceleration_limit: f64,
+    /// Position overshoot limit in millimeters
+    #[clap(long, default_value = "2.0")]
+    position_overshoot_limit: f64,
     /// Drive loop interval in milliseconds
     #[clap(short, long, default_value = "5")]
     loop_interval: u64,
@@ -109,6 +112,7 @@ fn main() -> Result<()> {
     let drive = drive::ConnectionManager::new(
         options.drive_address,
         Duration::from_millis(options.loop_interval),
+        Position::from_millimeters_f64(options.position_overshoot_limit),
         core_sender.clone(),
         metrics.map(|m| m.sender.clone()),
     );
