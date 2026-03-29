@@ -13,7 +13,7 @@ use ratatui::DefaultTerminal;
 use ratatui::crossterm::event;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, LineGauge, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, LineGauge, List, ListItem, Paragraph};
 use signal_hook::consts::signal::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,7 +34,7 @@ struct Options {
 }
 
 fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    env_logger::init();
 
     let options = Options::parse();
 
@@ -43,6 +43,13 @@ fn main() -> Result<()> {
     ratatui::restore();
 
     app_result
+}
+
+#[derive(Clone)]
+struct InputDialog {
+    input: String,
+    targets: Vec<(usize, bool)>, // index in inputs, checked
+    selected_row: usize,         // 0 for text input, 1+ for checkboxes
 }
 
 struct App {
@@ -58,6 +65,7 @@ struct App {
     last_key: Option<(KeyCode, Instant)>,
     repeat_count: u32,
     ws_handle: Option<thread::JoinHandle<()>>,
+    dialog: Option<InputDialog>,
 }
 
 impl App {
@@ -163,6 +171,7 @@ impl App {
             last_key: None,
             repeat_count: 0,
             ws_handle: Some(ws_handle),
+            dialog: None,
         }
     }
 
@@ -250,11 +259,122 @@ impl App {
         s
     }
 
+    fn apply_dialog(&mut self, dialog: &InputDialog) {
+        if let Ok(mut val) = dialog.input.trim().parse::<f64>() {
+            let unit_type = self.input_index % 4;
+
+            // Clamp input by system limits if available
+            if let Some(limits) = &self.limits {
+                match unit_type {
+                    0 => {
+                        let limit_mm = limits.position.0 as f64 / 10_000.0;
+                        val = val.clamp(-limit_mm.abs(), limit_mm.abs());
+                    }
+                    1 => {
+                        let limit_m_s = limits.velocity.0 as f64 / 1_000_000.0;
+                        val = val.clamp(0.0, limit_m_s);
+                    }
+                    2 => {
+                        let limit_m_s2 = limits.acceleration.0 as f64 / 100_000.0;
+                        val = val.clamp(0.0, limit_m_s2);
+                    }
+                    3 => {
+                        let limit_m_s2 = limits.deceleration.0 as f64 / 100_000.0;
+                        val = val.clamp(0.0, limit_m_s2);
+                    }
+                    _ => {}
+                }
+            }
+
+            let raw_val = match unit_type {
+                0 => Position::from_millimeters_f64(val).0,
+                1 => Velocity::from_meters_per_second_f64(val).0,
+                2 | 3 => Acceleration::from_meters_per_second_squared_f64(val).0,
+                _ => unreachable!(),
+            };
+
+            for (idx, checked) in &dialog.targets {
+                if *checked {
+                    self.inputs[*idx] = raw_val;
+                }
+            }
+
+            // Send update to server if we have write access
+            if let Some(state) = &self.state {
+                if state.write_access_holder.is_some() {
+                    let cmd = MotionCommand {
+                        position: Position(self.inputs[0]),
+                        velocity: Velocity(self.inputs[1]),
+                        acceleration: Acceleration(self.inputs[2]),
+                        deceleration: Acceleration(self.inputs[3]),
+                    };
+                    let cmd2 = MotionCommand {
+                        position: Position(self.inputs[4]),
+                        velocity: Velocity(self.inputs[5]),
+                        acceleration: Acceleration(self.inputs[6]),
+                        deceleration: Acceleration(self.inputs[7]),
+                    };
+                    let seq = self.next_seq();
+                    self.send(ClientMessage::UpsertCommandSet {
+                        seq,
+                        set: None,
+                        base_version: None,
+                        commands: vec![cmd, cmd2],
+                    });
+                }
+            }
+        }
+    }
+
     fn send(&self, msg: ClientMessage) {
         self.tx.send(Some(msg)).ok();
     }
 
     fn handle_key_event(&mut self, key_event: KeyEvent) -> Result<()> {
+        if let Some(mut dialog) = self.dialog.take() {
+            match key_event.code {
+                KeyCode::Esc => {
+                    self.dialog = None;
+                }
+                KeyCode::Enter => {
+                    self.apply_dialog(&dialog);
+                    self.dialog = None;
+                }
+                KeyCode::Up => {
+                    if dialog.selected_row > 0 {
+                        dialog.selected_row -= 1;
+                    }
+                }
+                KeyCode::Down => {
+                    if dialog.selected_row <= dialog.targets.len() {
+                        dialog.selected_row += 1;
+                    }
+                }
+                KeyCode::Char(' ') => {
+                    if dialog.selected_row == 0 {
+                        dialog.input.push(' ');
+                    } else if dialog.selected_row <= dialog.targets.len() {
+                        dialog.targets[dialog.selected_row - 1].1 = !dialog.targets[dialog.selected_row - 1].1;
+                    }
+                }
+                KeyCode::Char(c) => {
+                    if dialog.selected_row == 0 {
+                        dialog.input.push(c);
+                    }
+                }
+                KeyCode::Backspace => {
+                    if dialog.selected_row == 0 {
+                        dialog.input.pop();
+                    }
+                }
+                _ => {}
+            }
+            if self.dialog.is_none() && key_event.code != KeyCode::Esc && key_event.code != KeyCode::Enter {
+                self.dialog = Some(dialog);
+            }
+            return Ok(());
+        }
+
         let now = Instant::now();
         let _is_repeat = if let Some((last_code, last_time)) = self.last_key {
             if last_code == key_event.code && now.duration_since(last_time) < Duration::from_millis(150) {
@@ -338,6 +458,29 @@ impl App {
             KeyCode::Char('r') => {
                 if has_write_access {
                     self.reset_inputs();
+                }
+            }
+            KeyCode::Char(' ') => {
+                if has_write_access {
+                    let mut targets = vec![(self.input_index, true)];
+                    let unit_type = self.input_index % 4;
+                    for i in 0..8 {
+                        if i == self.input_index {
+                            continue;
+                        }
+                        let other_unit_type = i % 4;
+                        let should_include = match unit_type {
+                            0 => other_unit_type == 0,
+                            1 => other_unit_type == 1,
+                            2 | 3 => other_unit_type == 2 || other_unit_type == 3,
+                            _ => false,
+                        };
+                        if should_include {
+                            targets.push((i, false));
+                        }
+                    }
+                    targets.sort_by_key(|t| t.0);
+                    self.dialog = Some(InputDialog { input: String::new(), targets, selected_row: 0 });
                 }
             }
             _ => {}
@@ -453,11 +596,82 @@ impl App {
     fn draw(&self, frame: &mut Frame) {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(0), Constraint::Length(60)])
+            .constraints([Constraint::Min(0), Constraint::Length(58)])
             .split(frame.area());
 
         self.draw_left(frame, chunks[0]);
         self.draw_right(frame, chunks[1]);
+
+        if let Some(dialog) = &self.dialog {
+            let area = self.centered_rect(40, 15, chunks[0]);
+            frame.render_widget(Clear, area);
+
+            let block = Block::bordered().title(" Set Value ");
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+
+            let unit = match self.input_index % 4 {
+                0 => "mm",
+                1 => "m/s",
+                _ => "m/s²",
+            };
+
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(3), Constraint::Min(0)])
+                .split(inner);
+
+            let input_style =
+                if dialog.selected_row == 0 { Style::default().fg(Color::Yellow) } else { Style::default() };
+
+            let input_text = format!("{}: {}█", unit, dialog.input);
+            frame.render_widget(
+                Paragraph::new(input_text).block(Block::bordered().title(" Value ")).style(input_style),
+                chunks[0],
+            );
+
+            let labels = [
+                "Start Position",
+                "Start Velocity",
+                "Start Acceleration",
+                "Start Deceleration",
+                "  End Position",
+                "  End Velocity",
+                "  End Acceleration",
+                "  End Deceleration",
+            ];
+
+            let mut items = Vec::new();
+            for (idx, (input_idx, checked)) in dialog.targets.iter().enumerate() {
+                let checkbox = if *checked { "[x]" } else { "[ ]" };
+                let style =
+                    if dialog.selected_row == idx + 1 { Style::default().fg(Color::Yellow) } else { Style::default() };
+                items.push(ListItem::new(format!("{} {}", checkbox, labels[*input_idx])).style(style));
+            }
+
+            let list = List::new(items).block(Block::bordered().title(" Apply To "));
+            frame.render_widget(list, chunks[1]);
+        }
+    }
+
+    fn centered_rect(&self, width: u16, height: u16, r: Rect) -> Rect {
+        let popup_layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(r.height.saturating_sub(height) / 2),
+                Constraint::Length(height),
+                Constraint::Min(0),
+            ])
+            .split(r);
+
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(r.width.saturating_sub(width) / 2),
+                Constraint::Length(width),
+                Constraint::Min(0),
+            ])
+            .split(popup_layout[1])[1]
     }
 
     fn draw_left(&self, frame: &mut Frame, area: Rect) {
@@ -491,9 +705,15 @@ impl App {
             "  End Deceleration",
         ];
 
-        let block = Block::bordered().title(" Inputs (Up/Down Select, Left/Right Adjust) ");
+        let block = Block::bordered().title(" Inputs (Up/Down Select, Left/Right Adjust, Space Set Value) ");
         let inner_area = block.inner(area);
         frame.render_widget(block, area);
+
+        // Add 1-line top padding to the content area
+        let inner_area = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .split(inner_area)[1];
 
         let input_height = if inner_area.height >= 16 { 2 } else { 1 };
         let constraints = vec![Constraint::Length(input_height); 8];
@@ -501,7 +721,6 @@ impl App {
 
         for i in 0..8 {
             let is_selected = i == self.input_index;
-            let label_prefix = if is_selected { "▶ " } else { "  " };
 
             let (filled_style, unfilled_style) = if is_selected {
                 (
@@ -547,31 +766,37 @@ impl App {
                 (None, 0.0)
             };
 
-            let label_text = format!("{}{}", label_prefix, labels[i]);
+            let label_text = labels[i];
 
             if input_height == 1 {
-                // 1-line mode: [Label (22)] [Value (12)] [Gauge (flexible)] [Limit (12)]
+                // 1-line mode: [Indicator (2)] [Label (20)] [Value (12)] [Gauge (flexible)] [Limit (12)]
                 let row_chunks = Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints([
-                        Constraint::Length(22),
+                        Constraint::Length(2), // Indicator (No padding here)
+                        Constraint::Length(20),
                         Constraint::Length(12),
                         Constraint::Min(0),
                         Constraint::Length(12),
+                        Constraint::Length(1), // Padding on right
                     ])
                     .split(chunks[i]);
 
-                frame.render_widget(Paragraph::new(label_text).style(filled_style), row_chunks[0]);
-                frame.render_widget(Paragraph::new(val_str).style(filled_style), row_chunks[1]);
+                if is_selected {
+                    frame.render_widget(Paragraph::new("▶").style(filled_style), row_chunks[0]);
+                }
+                frame.render_widget(Paragraph::new(label_text).style(filled_style), row_chunks[1]);
+                frame.render_widget(Paragraph::new(val_str).style(filled_style), row_chunks[2]);
 
                 if let Some(limit_str) = limit_info {
                     let gauge = LineGauge::default()
                         .filled_style(filled_style)
                         .unfilled_style(unfilled_style)
                         .ratio(ratio)
+                        .label("")
                         .line_set(symbols::line::THICK);
-                    frame.render_widget(gauge, row_chunks[2]);
-                    frame.render_widget(Paragraph::new(limit_str).alignment(Alignment::Right), row_chunks[3]);
+                    frame.render_widget(gauge, row_chunks[3]);
+                    frame.render_widget(Paragraph::new(limit_str).alignment(Alignment::Right), row_chunks[4]);
                 }
             } else {
                 // 2-line mode
@@ -582,21 +807,40 @@ impl App {
 
                 let l1_chunks = Layout::default()
                     .direction(Direction::Horizontal)
-                    .constraints([Constraint::Length(22), Constraint::Length(12), Constraint::Min(0)])
+                    .constraints([
+                        Constraint::Length(2), // Indicator (No padding here)
+                        Constraint::Length(20),
+                        Constraint::Length(12),
+                        Constraint::Min(0),
+                        Constraint::Length(1), // Padding on right
+                    ])
                     .split(lines[0]);
 
-                frame.render_widget(Paragraph::new(label_text).style(filled_style), l1_chunks[0]);
-                frame.render_widget(Paragraph::new(val_str).style(filled_style), l1_chunks[1]);
+                if is_selected {
+                    frame.render_widget(Paragraph::new("▶").style(filled_style), l1_chunks[0]);
+                }
+                frame.render_widget(Paragraph::new(label_text).style(filled_style), l1_chunks[1]);
+                frame.render_widget(Paragraph::new(val_str).style(filled_style), l1_chunks[2]);
 
                 if let Some(limit_str) = limit_info {
-                    frame.render_widget(Paragraph::new(limit_str).alignment(Alignment::Right), l1_chunks[2]);
+                    frame.render_widget(Paragraph::new(limit_str).alignment(Alignment::Right), l1_chunks[3]);
+
+                    let l2_chunks = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([
+                            Constraint::Length(1), // Match indicator start? No, user said indicator was inset.
+                            Constraint::Min(0),
+                            Constraint::Length(1), // Padding
+                        ])
+                        .split(lines[1]);
 
                     let gauge = LineGauge::default()
                         .filled_style(filled_style)
                         .unfilled_style(unfilled_style)
                         .ratio(ratio)
+                        .label("")
                         .line_set(symbols::line::THICK);
-                    frame.render_widget(gauge, lines[1]);
+                    frame.render_widget(gauge, l2_chunks[1]);
                 }
             }
         }
@@ -631,6 +875,13 @@ impl App {
         let inner_area = block.inner(area);
         frame.render_widget(block, area);
 
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .split(inner_area);
+
+        let inner_area = chunks[1];
+
         if let Some(state) = &self.state {
             let holder = match state.write_access_holder {
                 Some(h) => {
@@ -661,10 +912,9 @@ impl App {
                 holder
             );
 
-            let controls_text = format!(
-                " [W] Write Access   [P] Toggle Power   [R] Reset Inputs\n \
-                  [M] Motion Toggle  [A] Ack Error      [Q] Quit"
-            );
+            let controls_text = " [W] Write Access   [P] Toggle Power  [R] Reset Inputs\n \
+                                         [M] Motion Toggle  [A] Ack Error     [Q] Quit"
+                .to_string();
 
             let main_chunks = Layout::default()
                 .direction(Direction::Vertical)
@@ -683,7 +933,7 @@ impl App {
                 main_chunks[1],
             );
         } else {
-            frame.render_widget(Paragraph::new("Connecting..."), inner_area);
+            frame.render_widget(Paragraph::new("  Connecting..."), inner_area);
         }
     }
 }
