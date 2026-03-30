@@ -11,7 +11,7 @@ pub enum HidInputEvent {
     MenuCancel { display_id: u8 },
 }
 
-/// A decoded HID InputReport.
+/// A decoded HID input report.
 #[derive(Debug, Clone)]
 pub struct InputReport {
     pub active_screen_id: u8,
@@ -27,11 +27,18 @@ pub struct DeviceInfo {
     pub features: u8,
 }
 
+/// A HID output report to send.
+#[derive(Debug, Clone)]
+pub enum OutputReport {
+    ScreenSpec(ScreenSpec),
+    VariableUpdate(Vec<VariableEntry>),
+}
+
 /// Content type for a display main area in a ScreenSpec.
 #[derive(Debug, Clone)]
 pub enum DisplayContent {
-    TextLines { lines: Vec<CString> },
-    Menu { title: CString, items: Vec<MenuItem> },
+    TextLines { top_margin: u8, lines: Vec<CString> },
+    Menu { top_margin: u8, title: CString, items: Vec<MenuItem> },
 }
 
 /// A single menu item in a ScreenSpec menu.
@@ -60,8 +67,9 @@ pub struct ScreenSpec {
 
 #[derive(Debug, Clone)]
 pub enum HardwareControl {
-    SleepLevel { can_deep_sleep: bool },
     LedRingValue { ring_id: u8, value: u8 },
+    Reset,
+    SleepLevel { can_deep_sleep: bool },
 }
 
 /// VariableUpdate entry types (compact format).

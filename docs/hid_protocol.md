@@ -172,15 +172,17 @@ varies  varies  secondary_label      Null-terminated UTF-8 string
 
 ```
 Offset  Size    Field
-0       1       line_count           Number of lines (0-3)
-1       varies  lines[]              Sequential null-terminated UTF-8 strings
+0       1       top_margin           Top margin in pixels
+1       1       line_count           Number of lines (0-6)
+2       varies  lines[]              Sequential null-terminated UTF-8 strings
 ```
 
 **Menu data:**
 
 ```
 Offset  Size    Field
-0       varies  title                Null-terminated UTF-8 string
+0       1       top_margin           Top margin in pixels
+1       varies  title                Null-terminated UTF-8 string
 varies  1       item_count           Number of menu items (0-63)
 varies  varies  items[]              Sequential MenuItem definitions
 ```
@@ -277,12 +279,13 @@ indices used by types 0-1.
 
 | Index | Parameter   | Values                                   |
 |-------|-------------|------------------------------------------|
-| 0     | Sleep level | 0 = screens may dim; 1 = screens may off |
-| 1     | LED ring 1  | 0 = off, 1-255 = normalised position     |
-| 2     | LED ring 2  | 0 = off, 1-255 = normalised position     |
-| 3     | LED ring 3  | 0 = off, 1-255 = normalised position     |
-| 4     | LED ring 4  | 0 = off, 1-255 = normalised position     |
-| 5-31  | Reserved    | Reserved for future hardware parameters  |
+| 0     | LED ring 1  | 0 = off, 1-255 = normalised position     |
+| 1     | LED ring 2  | 0 = off, 1-255 = normalised position     |
+| 2     | LED ring 3  | 0 = off, 1-255 = normalised position     |
+| 3     | LED ring 4  | 0 = off, 1-255 = normalised position     |
+| 4     | Reset       | 1 = reset device                         |
+| 5     | Sleep level | 0 = screens may dim; 1 = screens may off |
+| 6-31  | Reserved    | Reserved for future hardware parameters  |
 
 LED ring values: 0 turns all LEDs off. Values 1-255 map linearly to
 the physical LED count on the ring.
@@ -304,7 +307,7 @@ Hex: 02 02 06 01 D4 30 63 80
 02             report_id = 0x02
 02             count = 2
 06 01 D430     FixedPoint idx=6, decimals=1, value=12500 (LE) → "1250.0"
-63 80          HardwareControl idx=3, value=128 (LED ring 3 at ~50%)
+63 80          HardwareControl idx=3, value=128 (LED ring 4 at ~50%)
 
 Total: 8 bytes
 ```
@@ -321,11 +324,11 @@ Total: 8 bytes
 | Target pos | FixedPoint      | 5   | dec=1, 1250 | 4    | "125.0"  |
 | Actual pos | FixedPoint      | 6   | dec=1, 1249 | 4    | "124.9"  |
 | Warnings   | ShortString     | 7   | "OC, OT"\0  | 9    | "OC, OT" |
-| Sleep      | HardwareControl | 0   | 0           | 2    | dim only |
-| LED E1     | HardwareControl | 1   | 128         | 2    | ~50%     |
-| LED E2     | HardwareControl | 2   | 255         | 2    | ~100%    |
-| LED E3     | HardwareControl | 3   | 64          | 2    | ~25%     |
-| LED E4     | HardwareControl | 4   | 32          | 2    | ~12%     |
+| Sleep      | HardwareControl | 5   | 0           | 2    | dim only |
+| LED E1     | HardwareControl | 0   | 128         | 2    | ~50%     |
+| LED E2     | HardwareControl | 1   | 255         | 2    | ~100%    |
+| LED E3     | HardwareControl | 2   | 64          | 2    | ~25%     |
+| LED E4     | HardwareControl | 3   | 32          | 2    | ~12%     |
 
 **Total:** 2 (header) + 51 (entries) = 53 bytes. Single HID report.
 
@@ -611,8 +614,8 @@ type space is exhausted.
      entries: [
        { idx 0, FixedPoint: dec=1, 165 },    "16.5"
        { idx 1, FixedPoint: dec=1, 250 },    "25.0"
-       { idx 1, HardwareControl: 140 },      LED ring 1
-       { idx 2, HardwareControl: 255 },      LED ring 2
+       { idx 0, HardwareControl: 140 },      LED ring 1
+       { idx 1, HardwareControl: 255 },      LED ring 2
      ]
    }
 

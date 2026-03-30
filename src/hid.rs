@@ -49,7 +49,7 @@ fn run_loop(vendor_id: u16, product_id: u16) -> Result<()> {
             }
         };
 
-        info!("Found HID device: {:#?}", device_info);
+        info!("Found HID device with serial: {}", device_info.serial_number().unwrap_or("Unknown"));
 
         let device = match device_info.open_device(&api) {
             Ok(d) => d,
@@ -72,7 +72,7 @@ const SUPPORTED_FIRMWARE_MAJOR: u8 = 0x01;
 fn connect_to_device(device: &HidDevice) -> Result<()> {
     let device_info = read_device_info(device)?;
 
-    info!("Device info: {:#?}", device_info);
+    info!("Device info: {:?}", device_info);
 
     if device_info.firmware_version_major != SUPPORTED_FIRMWARE_MAJOR {
         return Err(anyhow!(
@@ -81,33 +81,6 @@ fn connect_to_device(device: &HidDevice) -> Result<()> {
             device_info.firmware_version_minor
         ));
     }
-
-    let screen_spec = ScreenSpec {
-        screen_id: 1,
-        encoder_labels: [
-            EncoderLabel { primary: c"One".to_owned(), secondary: c"Two".to_owned() },
-            EncoderLabel { primary: c"Three".to_owned(), secondary: c"Four".to_owned() },
-            EncoderLabel { primary: c"Five".to_owned(), secondary: c"Six".to_owned() },
-            EncoderLabel { primary: c"Seven".to_owned(), secondary: c"Eight".to_owned() },
-        ],
-        left_main: DisplayContent::Menu {
-            title: c"Menu Title".to_owned(),
-            items: vec![
-                MenuItem { item_id: 1, enabled: true, label: c"Item 1".to_owned() },
-                MenuItem { item_id: 2, enabled: false, label: c"Item 2".to_owned() },
-                MenuItem { item_id: 3, enabled: true, label: c"Item 3".to_owned() },
-                MenuItem { item_id: 4, enabled: true, label: c"Item 4".to_owned() },
-                MenuItem { item_id: 5, enabled: true, label: c"Item 5".to_owned() },
-            ],
-        },
-        right_main: DisplayContent::TextLines {
-            lines: vec![c"Line 1".to_owned(), c"Line 2".to_owned(), c"Line 3".to_owned()],
-        },
-    };
-
-    send_screen_update(device, screen_spec)?;
-
-    let mut report_buf = [0u8; HID_REPORT_LEN];
 
     loop {
         let report = read_input_report(device, -1)?;
@@ -152,7 +125,7 @@ fn read_device_info<D: HidDeviceBackend>(device: &D) -> Result<DeviceInfo> {
     })
 }
 
-fn send_screen_update<D: HidDeviceBackend>(device: &D, screen_spec: ScreenSpec) -> Result<()> {
+fn send_screen_update<D: HidDeviceBackend>(device: &D, screen_spec: &ScreenSpec) -> Result<()> {
     let payload = screen_spec.encode()?;
 
     const HEADER_LEN: usize = 4;
@@ -192,23 +165,25 @@ impl ScreenSpec {
 
         for area in [&self.left_main, &self.right_main] {
             match area {
-                DisplayContent::TextLines { lines } => {
+                DisplayContent::TextLines { top_margin, lines } => {
                     if lines.len() > u8::MAX as usize {
                         return Err(anyhow!("TextLines too long to transmit ({} lines)", lines.len()));
                     }
 
                     payload.push(0x00);
+                    payload.push(*top_margin);
                     payload.push(lines.len() as u8);
                     for line in lines.iter() {
                         payload.extend(line.as_bytes_with_nul());
                     }
                 }
-                DisplayContent::Menu { title, items } => {
+                DisplayContent::Menu { top_margin, title, items } => {
                     if items.len() > u8::MAX as usize {
                         return Err(anyhow!("Menu too long to transmit ({} items)", items.len()));
                     }
 
                     payload.push(0x01);
+                    payload.push(*top_margin);
                     payload.extend(title.as_bytes_with_nul());
                     payload.push(items.len() as u8);
                     for item in items.iter() {
@@ -303,14 +278,15 @@ impl VariableEntry {
             }
             VariableEntry::HardwareControl(hw) => {
                 let (index, value) = match hw {
-                    HardwareControl::SleepLevel { can_deep_sleep } => (0u8, *can_deep_sleep as u8),
                     HardwareControl::LedRingValue { ring_id, value } => {
                         if *ring_id >= 4 {
                             return Err(anyhow!("Invalid ring ID {}", ring_id));
                         }
 
-                        (1u8 + *ring_id, *value)
+                        (*ring_id, *value)
                     }
+                    HardwareControl::Reset => (4u8, 1u8),
+                    HardwareControl::SleepLevel { can_deep_sleep } => (5u8, *can_deep_sleep as u8),
                 };
 
                 buf[0] = (0b11 << 5) | (index & 0x1F);
@@ -500,6 +476,7 @@ mod tests {
                 EncoderLabel { primary: c"Seven".to_owned(), secondary: c"Eight".to_owned() },
             ],
             left_main: DisplayContent::Menu {
+                top_margin: 0,
                 title: c"Menu Title".to_owned(),
                 items: vec![
                     MenuItem { item_id: 1, enabled: true, label: c"Item 1".to_owned() },
@@ -509,11 +486,12 @@ mod tests {
                 ],
             },
             right_main: DisplayContent::TextLines {
+                top_margin: 0,
                 lines: vec![c"Line 1".to_owned(), c"Line 2".to_owned(), c"Line 3".to_owned()],
             },
         };
 
-        send_screen_update(&mock, spec).unwrap();
+        send_screen_update(&mock, &spec).unwrap();
 
         let reports = mock.get_output_reports();
         assert_eq!(reports.len(), 2);
@@ -522,17 +500,17 @@ mod tests {
             [
                 0x01, 0x01, 0x02, 0x00, 0x4F, 0x6E, 0x65, 0x00, 0x54, 0x77, 0x6F, 0x00, 0x54, 0x68, 0x72, 0x65, 0x65,
                 0x00, 0x46, 0x6F, 0x75, 0x72, 0x00, 0x46, 0x69, 0x76, 0x65, 0x00, 0x53, 0x69, 0x78, 0x00, 0x53, 0x65,
-                0x76, 0x65, 0x6E, 0x00, 0x45, 0x69, 0x67, 0x68, 0x74, 0x00, 0x01, 0x4D, 0x65, 0x6E, 0x75, 0x20, 0x54,
-                0x69, 0x74, 0x6C, 0x65, 0x00, 0x04, 0x01, 0x01, 0x49, 0x74, 0x65, 0x6D, 0x20,
+                0x76, 0x65, 0x6E, 0x00, 0x45, 0x69, 0x67, 0x68, 0x74, 0x00, 0x01, 0x00, 0x4D, 0x65, 0x6E, 0x75, 0x20,
+                0x54, 0x69, 0x74, 0x6C, 0x65, 0x00, 0x04, 0x01, 0x01, 0x49, 0x74, 0x65, 0x6D,
             ]
         );
         assert_eq!(
             reports[1],
             [
-                0x01, 0x01, 0x02, 0x01, 0x31, 0x00, 0x02, 0x00, 0x49, 0x74, 0x65, 0x6D, 0x20, 0x32, 0x00, 0x03, 0x01,
-                0x49, 0x74, 0x65, 0x6D, 0x20, 0x33, 0x00, 0x04, 0x01, 0x49, 0x74, 0x65, 0x6D, 0x20, 0x34, 0x00, 0x00,
-                0x03, 0x4C, 0x69, 0x6E, 0x65, 0x20, 0x31, 0x00, 0x4C, 0x69, 0x6E, 0x65, 0x20, 0x32, 0x00, 0x4C, 0x69,
-                0x6E, 0x65, 0x20, 0x33, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x01, 0x01, 0x02, 0x01, 0x20, 0x31, 0x00, 0x02, 0x00, 0x49, 0x74, 0x65, 0x6D, 0x20, 0x32, 0x00, 0x03,
+                0x01, 0x49, 0x74, 0x65, 0x6D, 0x20, 0x33, 0x00, 0x04, 0x01, 0x49, 0x74, 0x65, 0x6D, 0x20, 0x34, 0x00,
+                0x00, 0x00, 0x03, 0x4C, 0x69, 0x6E, 0x65, 0x20, 0x31, 0x00, 0x4C, 0x69, 0x6E, 0x65, 0x20, 0x32, 0x00,
+                0x4C, 0x69, 0x6E, 0x65, 0x20, 0x33, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             ]
         );
     }
@@ -555,7 +533,7 @@ mod tests {
         assert_eq!(
             reports[0],
             [
-                0x02, 0x04, 0x05, 0x02, 0xD2, 0x04, 0x2C, 0x48, 0x65, 0x6C, 0x6C, 0x6F, 0x00, 0x60, 0x01, 0x63, 0xC8,
+                0x02, 0x04, 0x05, 0x02, 0xD2, 0x04, 0x2C, 0x48, 0x65, 0x6C, 0x6C, 0x6F, 0x00, 0x65, 0x01, 0x62, 0xC8,
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
