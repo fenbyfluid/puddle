@@ -6,7 +6,7 @@ StartLimitIntervalSec=0
 [Service]
 Restart=on-failure
 RestartSec=10s
-ExecStart=/usr/bin/puddle --enable-usb ${PUDDLE_DRIVE_ADDRESS}
+ExecStart=/usr/bin/puddle --enable-usb --enable-websocket ${PUDDLE_DRIVE_ADDRESS}
 
 [Install]
 WantedBy=multi-user.target
