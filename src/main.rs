@@ -1,4 +1,5 @@
 use crate::drive::{ACTION_ACK_ERROR, ACTION_RESET_INDEX, DriveFeedback};
+use crate::hid::messages::InputReport;
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use linmot::mci::ErrorCode;
@@ -74,8 +75,8 @@ fn main() -> Result<()> {
 
     let (core_sender, core_receiver) = mpsc::channel();
 
-    let hid_controller = if options.enable_usb {
-        Some(hid::Controller::new(options.usb_vid, options.usb_pid, core_sender.clone())?)
+    let hi_io_manager = if options.enable_usb {
+        Some(hid::IoManager::new(options.usb_vid, options.usb_pid, core_sender.clone())?)
     } else {
         None
     };
@@ -86,7 +87,7 @@ fn main() -> Result<()> {
         None
     };
 
-    if hid_controller.is_none() && websocket_server.is_none() {
+    if hi_io_manager.is_none() && websocket_server.is_none() {
         return Err(anyhow!("No controller interfaces enabled"));
     }
 
@@ -117,7 +118,7 @@ fn main() -> Result<()> {
         metrics.map(|m| m.sender.clone()),
     );
 
-    let mut core_manager = CoreManager::new(limits, drive, hid_controller, websocket_server);
+    let mut core_manager = CoreManager::new(limits, drive, hi_io_manager, websocket_server);
 
     loop {
         let message = match core_receiver.recv() {
@@ -141,12 +142,15 @@ enum CoreEvent {
 
     // From drive thread
     DriveStateUpdated(DriveFeedback),
+
+    // From HID I/O thread
+    HidInputReport(InputReport),
 }
 
 struct CoreManager {
     limits: SystemLimits,
     drive: drive::ConnectionManager,
-    hid_controller: Option<hid::Controller>,
+    hid_ui: Option<hid::UiManager>,
     websocket_server: Option<websocket::Server>,
     core_state: CoreState,
     active_command_set: (u64, Vec<MotionCommand>),
@@ -158,13 +162,13 @@ impl CoreManager {
     fn new(
         limits: SystemLimits,
         drive: drive::ConnectionManager,
-        hid_controller: Option<hid::Controller>,
+        hid_io: Option<hid::IoManager>,
         websocket_server: Option<websocket::Server>,
     ) -> Self {
         Self {
             limits,
             drive,
-            hid_controller,
+            hid_ui: hid_io.map(|io| hid::UiManager::new(io)),
             websocket_server,
             core_state: CoreState::default(),
             active_command_set: (0, Vec::new()),
@@ -172,13 +176,13 @@ impl CoreManager {
         }
     }
 
-    fn send(&self, destination: Option<ControllerId>, message: CoreMessage) -> Result<()> {
+    fn send(&mut self, destination: Option<ControllerId>, message: CoreMessage) -> Result<()> {
         trace!("Sending message to {:?}: {:?}", destination, message);
 
         match destination {
             Some(ControllerId::Hid) => {
-                if let Some(hid_controller) = &self.hid_controller {
-                    hid_controller.handle_message(message)
+                if let Some(hid_ui) = &mut self.hid_ui {
+                    hid_ui.process_core_message(message)
                 } else {
                     Err(anyhow!("HID controller not enabled"))
                 }
@@ -191,8 +195,8 @@ impl CoreManager {
                 }
             }
             None => {
-                if let Some(hid_controller) = &self.hid_controller {
-                    hid_controller.handle_message(message.clone())?;
+                if let Some(hid_ui) = &mut self.hid_ui {
+                    hid_ui.process_core_message(message.clone())?;
                 }
                 if let Some(websocket_server) = &self.websocket_server {
                     websocket_server.send(None, message)?;
@@ -249,6 +253,14 @@ impl CoreManager {
                 };
 
                 self.send(None, CoreMessage::State { seq: None, state: self.core_state.clone() })
+            }
+            CoreEvent::HidInputReport(report) => {
+                if let Some(hid_ui) = &mut self.hid_ui {
+                    for message in hid_ui.process_input_report(report, &self.limits, &self.core_state)? {
+                        self.handle_message(ControllerId::Hid, message)?;
+                    }
+                }
+                Ok(())
             }
         }
     }

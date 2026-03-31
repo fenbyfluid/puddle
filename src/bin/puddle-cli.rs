@@ -212,6 +212,8 @@ impl App {
                 self.my_id = Some(controller_id);
                 self.limits = Some(limits);
                 self.state = Some(state);
+                let seq = self.next_seq();
+                self.send(ClientMessage::GetCommandSet { seq, set: None });
             }
             CoreMessage::State { state, .. } => {
                 self.state = Some(state);
@@ -246,6 +248,35 @@ impl App {
                         base_version: None,
                         commands: vec![cmd, cmd2],
                     });
+                }
+            }
+            CoreMessage::CommandSetChanged { update: None, .. } => {
+                let seq = self.next_seq();
+                self.send(ClientMessage::GetCommandSet { seq, set: None });
+            }
+            CoreMessage::CommandSetChanged { update: Some(update), .. } => {
+                if update.index < 2 {
+                    let base = update.index * 4;
+                    if let Some(pos) = update.fields.position {
+                        self.inputs[base + 0] = pos.0;
+                    }
+                    if let Some(vel) = update.fields.velocity {
+                        self.inputs[base + 1] = vel.0;
+                    }
+                    if let Some(accel) = update.fields.acceleration {
+                        self.inputs[base + 2] = accel.0;
+                    }
+                    if let Some(decel) = update.fields.deceleration {
+                        self.inputs[base + 3] = decel.0;
+                    }
+                }
+            }
+            CoreMessage::CommandSet { set: None, commands, .. } => {
+                for (i, cmd) in commands.iter().take(2).enumerate() {
+                    self.inputs[i * 4 + 0] = cmd.position.0;
+                    self.inputs[i * 4 + 1] = cmd.velocity.0;
+                    self.inputs[i * 4 + 2] = cmd.acceleration.0;
+                    self.inputs[i * 4 + 3] = cmd.deceleration.0;
                 }
             }
             _ => {}

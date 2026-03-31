@@ -65,7 +65,7 @@ pub struct ScreenSpec {
     pub right_main: DisplayContent,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum HardwareControl {
     LedRingValue { ring_id: u8, value: u8 },
     Reset,
@@ -73,7 +73,7 @@ pub enum HardwareControl {
 }
 
 /// VariableUpdate entry types (compact format).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum VariableEntry {
     FixedPoint { index: u8, decimals: u8, value: i16 },
     ShortString { index: u8, value: CString },

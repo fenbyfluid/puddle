@@ -1,38 +1,47 @@
 use crate::CoreEvent;
 use anyhow::{Result, anyhow};
 use hidapi::{HidApi, HidDevice, HidResult};
-use log::{debug, error, info, warn};
+use log::{error, info, trace, warn};
 use messages::*;
-use puddle::messages::CoreMessage;
+use puddle::ControllerId;
 use std::sync::mpsc;
 use std::time::Duration;
+pub use ui_manager::*;
 
-mod messages;
+pub mod messages;
+mod ui_manager;
 
-pub struct Controller {}
+pub struct IoManager {
+    outbound_sender: mpsc::Sender<OutputReport>,
+}
 
-impl Controller {
+impl IoManager {
     pub fn new(vendor_id: u16, product_id: u16, inbound_sender: mpsc::Sender<CoreEvent>) -> Result<Self> {
         info!("Starting USB HID controller support ({:04x}:{:04x})", vendor_id, product_id);
 
-        // TODO: Implement all the UI state management, split it out from the low-level stuff already here - how?
+        let (outbound_sender, outbound_receiver) = mpsc::channel();
 
         std::thread::spawn(move || {
-            if let Err(e) = run_loop(vendor_id, product_id) {
+            if let Err(e) = run_loop(vendor_id, product_id, outbound_receiver, inbound_sender) {
                 error!("USB HID device loop failed: {}", e);
             }
         });
 
-        Ok(Self {})
+        Ok(Self { outbound_sender })
     }
 
-    pub fn handle_message(&self, message: CoreMessage) -> Result<()> {
-        // TODO
+    pub fn send_report(&self, report: OutputReport) -> Result<()> {
+        self.outbound_sender.send(report)?;
         Ok(())
     }
 }
 
-fn run_loop(vendor_id: u16, product_id: u16) -> Result<()> {
+fn run_loop(
+    vendor_id: u16,
+    product_id: u16,
+    outbound_receiver: mpsc::Receiver<OutputReport>,
+    inbound_sender: mpsc::Sender<CoreEvent>,
+) -> Result<()> {
     let mut api = HidApi::new()?;
 
     loop {
@@ -60,16 +69,22 @@ fn run_loop(vendor_id: u16, product_id: u16) -> Result<()> {
             }
         };
 
-        if let Err(r) = connect_to_device(&device) {
+        if let Err(r) = connect_to_device(&device, &outbound_receiver, &inbound_sender) {
             error!("Error in USB HID device loop: {}", r);
         }
+
+        inbound_sender.send(CoreEvent::Disconnected { controller_id: ControllerId::Hid })?;
     }
 }
 
 const HID_REPORT_LEN: usize = 64;
 const SUPPORTED_FIRMWARE_MAJOR: u8 = 0x01;
 
-fn connect_to_device(device: &HidDevice) -> Result<()> {
+fn connect_to_device(
+    device: &HidDevice,
+    outbound_receiver: &mpsc::Receiver<OutputReport>,
+    inbound_sender: &mpsc::Sender<CoreEvent>,
+) -> Result<()> {
     let device_info = read_device_info(device)?;
 
     info!("Device info: {:?}", device_info);
@@ -82,10 +97,29 @@ fn connect_to_device(device: &HidDevice) -> Result<()> {
         ));
     }
 
+    inbound_sender.send(CoreEvent::Connected { controller_id: ControllerId::Hid })?;
+
     loop {
         let report = read_input_report(device, -1)?;
 
-        debug!("Input report: {:?}", report);
+        if let Some(report) = report {
+            trace!("Input report: {:?}", report);
+
+            inbound_sender.send(CoreEvent::HidInputReport(report))?;
+        }
+
+        while let Ok(report) = outbound_receiver.try_recv() {
+            trace!("Outbound report: {:?}", report);
+
+            match &report {
+                OutputReport::ScreenSpec(screen_spec) => {
+                    send_screen_update(device, screen_spec)?;
+                }
+                OutputReport::VariableUpdate(variables) => {
+                    send_variable_updates(device, variables)?;
+                }
+            }
+        }
     }
 }
 
