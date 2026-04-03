@@ -52,7 +52,7 @@ struct Options {
     #[clap(long, default_value = "15.0")]
     acceleration_limit: f64,
     /// Position overshoot limit in millimeters
-    #[clap(long, default_value = "2.0")]
+    #[clap(long, default_value = "5.0")]
     position_overshoot_limit: f64,
     /// Drive loop interval in milliseconds
     #[clap(short, long, default_value = "5")]
@@ -114,6 +114,8 @@ fn main() -> Result<()> {
         options.drive_address,
         Duration::from_millis(options.loop_interval),
         Position::from_millimeters_f64(options.position_overshoot_limit),
+        Acceleration::from_meters_per_second_squared_f64(options.acceleration_limit / 2.0),
+        Acceleration::from_meters_per_second_squared_f64(options.acceleration_limit * 2.0),
         core_sender.clone(),
         metrics.map(|m| m.sender.clone()),
     );
