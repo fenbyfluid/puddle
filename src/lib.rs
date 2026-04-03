@@ -9,15 +9,21 @@ pub mod messages;
 pub use linmot::mci::units;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS), ts(export_to = "bindings.ts"))]
 pub struct SystemLimits {
+    #[cfg_attr(test, ts(as = "i32"))]
     pub position: Position,
+    #[cfg_attr(test, ts(as = "i32"))]
     pub velocity: Velocity,
+    #[cfg_attr(test, ts(as = "i32"))]
     pub acceleration: Acceleration,
+    #[cfg_attr(test, ts(as = "i32"))]
     pub deceleration: Acceleration,
 }
 
 /// Controller identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(test, derive(ts_rs::TS), ts(as = "String", export_to = "bindings.ts"))]
 pub enum ControllerId {
     Hid,
     WebSocket(Token),
@@ -68,18 +74,25 @@ impl<'de> serde::Deserialize<'de> for ControllerId {
 
 // TODO: See the comment on drive::DriveFeedback, think about trimming this down.
 #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS), ts(export_to = "bindings.ts"))]
 pub struct CoreState {
     pub drive_state: DriveState,
     pub active_command_index: usize,
+    #[cfg_attr(test, ts(as = "i32"))]
     pub actual_position: Position,
+    #[cfg_attr(test, ts(as = "i32"))]
     pub demand_position: Position,
+    #[cfg_attr(test, ts(as = "i32"))]
     pub demand_velocity: Velocity,
+    #[cfg_attr(test, ts(as = "i32"))]
     pub demand_acceleration: Acceleration,
+    #[cfg_attr(test, ts(as = "i32"))]
     pub current_draw: Current,
+    #[cfg_attr(test, ts(as = "i32"))]
     pub drive_temperature: DriveTemperature,
+    #[cfg_attr(test, ts(as = "i32"))]
     pub motor_temperature: MotorTemperature,
     pub warnings: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
     pub command_set_version: u64,
     pub write_access_holder: Option<ControllerId>,

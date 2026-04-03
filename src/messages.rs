@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 /// Drive state machine states.
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(test, derive(ts_rs::TS), ts(export_to = "bindings.ts"))]
 pub enum DriveState {
     #[default]
     Disconnected,
@@ -21,10 +22,15 @@ pub enum DriveState {
 
 /// A single motion command in a command set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS), ts(export_to = "bindings.ts"))]
 pub struct MotionCommand {
+    #[cfg_attr(test, ts(as = "i32"))]
     pub position: Position,
+    #[cfg_attr(test, ts(as = "i32"))]
     pub velocity: Velocity,
+    #[cfg_attr(test, ts(as = "i32"))]
     pub acceleration: Acceleration,
+    #[cfg_attr(test, ts(as = "i32"))]
     pub deceleration: Acceleration,
 }
 
@@ -61,19 +67,25 @@ impl MotionCommand {
 
 /// Fields of a motion command that may be partially updated.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS), ts(optional_fields, export_to = "bindings.ts"))]
 pub struct MotionCommandFields {
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(as = "Option<i32>"))]
     pub position: Option<Position>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(as = "Option<i32>"))]
     pub velocity: Option<Velocity>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(as = "Option<i32>"))]
     pub acceleration: Option<Acceleration>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(as = "Option<i32>"))]
     pub deceleration: Option<Acceleration>,
 }
 
 /// Metadata for a saved command set, as returned in listings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS), ts(export_to = "bindings.ts"))]
 pub struct SavedSetMetadata {
     pub name: String,
     pub version: u64,
@@ -89,6 +101,7 @@ pub type CommandSetId = Option<String>;
 /// Motion control action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[cfg_attr(test, derive(ts_rs::TS), ts(export_to = "bindings.ts"))]
 pub enum MotionAction {
     Start,
     Pause,
@@ -98,6 +111,7 @@ pub enum MotionAction {
 
 /// Describes what changed in the active command set, for delta broadcasts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS), ts(export_to = "bindings.ts"))]
 pub struct CommandUpdate {
     pub index: usize,
     pub fields: MotionCommandFields,
@@ -111,6 +125,7 @@ pub struct CommandUpdate {
 /// send to the core.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[cfg_attr(test, derive(ts_rs::TS), ts(export, export_to = "bindings.ts"))]
 pub enum ClientMessage {
     RequestWriteAccess {
         seq: u64,
@@ -129,6 +144,7 @@ pub enum ClientMessage {
         seq: u64,
         set: CommandSetId,
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional = nullable))]
         base_version: Option<u64>,
         commands: Vec<MotionCommand>,
     },
@@ -141,6 +157,7 @@ pub enum ClientMessage {
         seq: u64,
         set: CommandSetId,
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional = nullable))]
         base_version: Option<u64>,
     },
     ListSavedSets {
@@ -165,6 +182,7 @@ pub enum ClientMessage {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(test, derive(ts_rs::TS), ts(export_to = "bindings.ts"))]
 pub enum AckFailureReason {
     NotWriter,
     NotFound,
@@ -180,6 +198,7 @@ pub enum AckFailureReason {
 /// convention that broadcasts have no `seq`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[cfg_attr(test, derive(ts_rs::TS), ts(export, export_to = "bindings.ts"))]
 pub enum CoreMessage {
     /// Sent on WebSocket connection open.
     Connected { controller_id: ControllerId, limits: SystemLimits, state: CoreState },
@@ -189,6 +208,7 @@ pub enum CoreMessage {
         seq: u64,
         success: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
         reason: Option<AckFailureReason>,
     },
 
@@ -210,6 +230,7 @@ pub enum CoreMessage {
     /// continuous broadcast (without seq).
     State {
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(optional))]
         seq: Option<u64>,
         #[serde(flatten)]
         state: CoreState,
@@ -219,6 +240,7 @@ pub enum CoreMessage {
     CommandSetChanged {
         version: u64,
         #[serde(flatten, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(test, ts(skip, optional))] // TODO: https://github.com/Aleph-Alpha/ts-rs/issues/461
         update: Option<CommandUpdate>,
     },
 
