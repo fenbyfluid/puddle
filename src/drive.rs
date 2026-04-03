@@ -160,8 +160,8 @@ pub struct Connection {
     active_command_index: usize,
     active_command_has_approached: bool,
     // The approach direction of the current command: sign(current_target - previous_target).
-    // None on the first command or after a reset. When None, clamp_deceleration falls back
-    // to the velocity/displacement sign heuristic.
+    // None on the first command, after a reset, or for zero-length legs. When None,
+    // clamp_deceleration falls back to the velocity/displacement sign heuristic.
     active_approach_direction: Option<i32>,
     input_commands: Vec<CoreMotionCommand>,
     last_request: Request,
@@ -412,36 +412,36 @@ impl Connection {
         let current_target = input_command.position;
 
         // Determine the approach direction for this command: the direction from the
-        // previous waypoint to this one. This is used by clamp_deceleration to
-        // correctly identify overshoots vs. normal mid-stroke reversal states.
+        // previous waypoint to this one. This is used by `clamp_deceleration()` to
+        // distinguish a genuine overshoot from a benign mid-stroke reversal state.
         //
-        // On the first command (or after a reset), we fall back to None, which
-        // causes clamp_deceleration to use the velocity/displacement heuristic.
+        // On the first command (or after a reset), this is `None`, which makes
+        // `clamp_deceleration()` fall back to the velocity/displacement heuristic.
         let approach_direction = self.active_approach_direction;
 
-        // Arrival detection: have we reached the current target waypoint?
+        // Arrival detection: have we reached the current target waypoint closely
+        // enough that the next command should be queued now?
         //
-        // Three cases, in order:
+        // Two cases, in order:
         //
         // 1. Exactly at target: always reached.
         //
-        // 2. Within the overshoot margin AND we have previously been observed moving
-        //    toward this target (has_approached): reached if now stationary or moving
-        //    away (the VAI has begun parking or reversing onto the target).
-        //    The has_approached guard prevents immediately declaring arrival when a new
-        //    target happens to start within the margin of the current position, which
-        //    would cause the drive to never move toward it.
-        //
-        // 3. Otherwise (outside the margin, or not yet committed): use predicted-
-        //    crossing detection. This handles the normal full-speed approach where the
-        //    drive will cross the target between this tick and the next.
-        //    Note: this can fail to fire when the drive decelerates to a stop just
-        //    short of the target, in which case case 2 takes over on subsequent ticks
-        //    once has_approached is set and the VAI begins its final parking move.
+        // 2. We have previously been observed moving toward this target (has_approached),
+        //    AND one of:
+        //    a. Stopped (v == 0): arrived, advance immediately to avoid a standstill.
+        //    b. Moving away: the VAI has begun parking or reversing onto the target.
+        //    c. Predicted crossing: the predicted near-future position crosses the target line;
+        //       hand off speculatively to keep velocity continuous.
+        //    d. Predicted stop: decelerating toward the target and predicted to reach zero
+        //       velocity (or reverse) within the same near-future horizon; hand off early so
+        //       the next command reaches the drive before it settles and avoids a standstill.
+        //    Without has_approached, only (c) can fire — guarding against premature
+        //    advance when a new target starts within range of the current position.
+        //    (a) and (b) are fallbacks for cases where prediction is unreliable, e.g.
+        //    after parameter changes or at very low velocities.
         let target_reached = {
             let displacement = current_target.0 as i64 - demand_position.0 as i64;
             let dist = displacement.unsigned_abs();
-            let margin = self.overshoot_margin.0.unsigned_abs() as u64;
             let v = demand_velocity.0 as i64;
 
             let moving_toward = match approach_direction {
@@ -454,24 +454,66 @@ impl Connection {
                 self.active_command_has_approached = true;
             }
 
+            let predicted_crossing = {
+                // Feedback is already one cycle old, and any command we queue here is only
+                // usable on a later cycle. Look ahead by three controller ticks so we bias
+                // slightly early rather than occasionally missing the handoff and creating a
+                // brief zero-acceleration plateau between commands.
+                let handoff_horizon = self.interval.saturating_mul(3);
+                let next_position =
+                    predict_position(demand_position, demand_velocity, demand_acceleration, handoff_horizon);
+                let distance_after = current_target.0 as i64 - next_position.0 as i64;
+                let crosses = (displacement > 0 && distance_after <= 0) || (displacement < 0 && distance_after >= 0);
+
+                // Also fire if the drive is decelerating toward the target and predicted to
+                // be closer than it is now but still short — i.e. about to stop near the target.
+                // Use the same three-cycle horizon so slightly-early handoff wins over a visible gap.
+                let a = demand_acceleration.0 as i64;
+                let next_v = predict_velocity(demand_velocity, demand_acceleration, handoff_horizon).0 as i64;
+                let decelerating_toward = moving_toward && ((v > 0 && a < 0) || (v < 0 && a > 0));
+                let will_stop_or_reverse = decelerating_toward && ((v > 0 && next_v <= 0) || (v < 0 && next_v >= 0));
+
+                // Safety gate for speculative crossing handoff:
+                // only hand off early if, from the current feedback state, a hard-stop clamp
+                // could still keep us within the target + overshoot margin bound.
+                //
+                // This preserves smoothness in normal operation but avoids reintroducing
+                // overshoot in pathological settings like very low/zero command deceleration.
+                let can_recover_with_hard_decel = {
+                    let stopping_budget = dist + self.overshoot_margin.0.unsigned_abs() as u64;
+                    let d_max = self.hard_deceleration_max.0 as u64;
+
+                    if stopping_budget == 0 {
+                        true
+                    } else if d_max == 0 {
+                        false
+                    } else {
+                        let v_sq = (v * v) as u64;
+                        let capacity = 2u64.saturating_mul(d_max).saturating_mul(stopping_budget);
+                        v_sq <= capacity
+                    }
+                };
+
+                (crosses && can_recover_with_hard_decel) || (self.active_command_has_approached && will_stop_or_reverse)
+            };
+
             if dist == 0 {
                 true
-            } else if dist <= margin && self.active_command_has_approached {
-                // Within arrival zone and we've committed to this target:
-                // reached if stopped (v==0) or moving away (VAI parking/reversing).
-                // We don't wait for moving_away to become true when already stopped,
-                // as that would add an unnecessary extra tick of latency.
-                v == 0 || !moving_toward
+            } else if self.active_command_has_approached && (v == 0 || !moving_toward) {
+                // Stopped or moving away after having approached: arrived.
+                // Note: no distance guard here — clamp_deceleration is responsible for
+                // overshoot protection if the drive is past the target when this fires.
+                true
             } else {
-                // Outside margin, or not yet committed: only reached by predicted crossing.
-                let next_position =
-                    predict_position(demand_position, demand_velocity, demand_acceleration, self.interval);
-                let distance_after = current_target.0 as i64 - next_position.0 as i64;
-                (displacement > 0 && distance_after <= 0) || (displacement < 0 && distance_after >= 0)
+                // Speculative advance: if has_approached, trust the crossing prediction to
+                // hand off one tick early, keeping velocity continuous through the waypoint.
+                // If not yet approached, this only fires on a genuine full-speed crossing,
+                // guarding against premature advance on a target that starts near current position.
+                predicted_crossing
             }
         };
 
-        let (clamp_target, clamp_approach_direction) = if target_reached {
+        let (mut clamp_target, mut clamp_approach_direction) = if target_reached {
             let prev_index = (self.active_command_index + self.input_commands.len() - 1) % self.input_commands.len();
             let prev_target = self.input_commands[prev_index].position;
 
@@ -480,11 +522,12 @@ impl Connection {
             self.active_command_has_approached = false;
             let next_command = self.input_commands.get(self.active_command_index).unwrap();
 
-            // The new approach direction is from current_target toward the next target.
+            // The new approach direction is from `current_target` toward the next target.
+            // Zero-length next legs normalize to `None`.
             let new_dir = (next_command.position.0 - current_target.0).signum();
-            self.active_approach_direction = Some(new_dir);
+            self.active_approach_direction = normalize_direction(new_dir);
 
-            // For the clamp this tick, protect against overshooting the target we just
+            // For the clamp on this tick, protect against overshooting the target we just
             // reached, using the approach direction we just completed.
             let completed_dir = (current_target.0 - prev_target.0).signum();
             (current_target, Some(completed_dir))
@@ -494,6 +537,18 @@ impl Connection {
 
         // Re-fetch after possible advance.
         let input_command = self.input_commands.get(self.active_command_index).unwrap();
+
+        // Keep previous-waypoint clamping alive across early handoff until the new leg is
+        // actually approached. This preserves smooth command pipelining while retaining
+        // the old bound during pipeline delay and momentum carry-over.
+        (clamp_target, clamp_approach_direction) = effective_clamp_target_after_handoff(
+            &self.input_commands,
+            self.active_command_index,
+            self.active_command_has_approached,
+            self.active_approach_direction,
+            clamp_target,
+            clamp_approach_direction,
+        );
 
         if !self.motion_enabled {
             let deceleration = clamp_deceleration(
@@ -579,6 +634,46 @@ pub fn predict_position(
     Position((p0 + vt + at2) as i32)
 }
 
+pub fn predict_velocity(velocity: Velocity, acceleration: Acceleration, duration: Duration) -> Velocity {
+    let t_us = duration.as_micros() as i64;
+
+    let v0 = velocity.0 as i64;
+    let a = acceleration.0 as i64;
+
+    Velocity((v0 + a * t_us / 100_000) as i32)
+}
+
+fn normalize_direction(direction: i32) -> Option<i32> {
+    match direction.signum() {
+        0 => None,
+        dir => Some(dir),
+    }
+}
+
+// After a speculative handoff, keep clamping against the previous waypoint until
+// the new leg has actually been observed. Once the new leg is approached, or if
+// there is no meaningful approach direction yet, fall back to the caller-provided
+// clamp target/direction.
+fn effective_clamp_target_after_handoff(
+    input_commands: &[CoreMotionCommand],
+    active_command_index: usize,
+    active_command_has_approached: bool,
+    active_approach_direction: Option<i32>,
+    fallback_target: Position,
+    fallback_approach_direction: Option<i32>,
+) -> (Position, Option<i32>) {
+    if active_command_has_approached || active_approach_direction.is_none() || input_commands.len() < 2 {
+        return (fallback_target, fallback_approach_direction);
+    }
+
+    let prev_index = (active_command_index + input_commands.len() - 1) % input_commands.len();
+    let prev_prev_index = (prev_index + input_commands.len() - 1) % input_commands.len();
+    let prev_target = input_commands[prev_index].position;
+    let prev_prev_target = input_commands[prev_prev_index].position;
+
+    (prev_target, normalize_direction(prev_target.0 - prev_prev_target.0))
+}
+
 /// Computes a safe deceleration value to send to the drive's built-in VAI engine.
 ///
 /// The VAI uses deceleration as its primary stopping parameter. The safety
@@ -620,8 +715,8 @@ pub fn clamp_deceleration(
     let v_sq = (v * v) as u64;
 
     // Determine whether the drive is moving past the target in the approach direction.
-    // With a known approach direction this is unambiguous. Without one, we use the
-    // sign of (velocity, displacement): moving away = velocity and displacement oppose.
+    // With a known approach direction this is unambiguous. Without one, we fall back to the
+    // sign of (`velocity`, `displacement`): moving away means they oppose each other.
     let past_target = match approach_direction {
         Some(dir) if dir != 0 => {
             // Past if we've gone beyond the target in the approach direction.
@@ -649,9 +744,9 @@ pub fn clamp_deceleration(
             let max = hard_decel_max.0 as u64;
             let scaled = min + (max - min) * t / 1000;
 
-            // This may happen harmlessly if the command parameters are changed.
-            // We don't know if we're actually in the deceleration phase at the time this is called.
-            warn!(
+            // This may happen harmlessly if command parameters were changed.
+            // We do not know whether the drive is already in its deceleration phase here.
+            info!(
                 "Recovering from overshoot of {:?}, applying {:?} deceleration",
                 Position(excess as i32),
                 Acceleration(scaled as i32),
@@ -715,6 +810,15 @@ fn log_state_change(old_state: &mut State, new_state: State) {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    fn cmd(position_mm: i32) -> CoreMotionCommand {
+        CoreMotionCommand {
+            position: Position::from_millimeters(position_mm),
+            velocity: Velocity::from_meters_per_second(1),
+            acceleration: Acceleration::from_meters_per_second_squared(4),
+            deceleration: Acceleration::from_meters_per_second_squared(4),
+        }
+    }
 
     // Shorthand for the common no-approach-direction case used in most tests.
     fn clamp(
@@ -822,6 +926,58 @@ mod tests {
             Duration::from_millis(10),
         );
         assert_position_mm(p, -105.1);
+    }
+
+    #[test]
+    fn predict_velocity_matches_acceleration_over_duration() {
+        let v = predict_velocity(
+            Velocity::from_meters_per_second(1),
+            Acceleration::from_meters_per_second_squared(-4),
+            Duration::from_millis(2),
+        );
+        assert_eq!(v, Velocity::from_meters_per_second_f64(0.992));
+    }
+
+    #[test]
+    fn early_handoff_keeps_previous_waypoint_clamp_until_new_leg_is_approached() {
+        // Two-command cycle 150 <-> 50. After early handoff to 150 while still moving toward 50,
+        // active index is 0 (150), but clamp must remain on previous waypoint (50) with
+        // completed approach direction -1 until motion actually approaches 150.
+        let commands = vec![cmd(150), cmd(50)];
+
+        let (target, direction) = effective_clamp_target_after_handoff(
+            &commands,
+            0,
+            false,
+            Some(1),
+            Position::from_millimeters(150),
+            Some(1),
+        );
+
+        assert_eq!(target, Position::from_millimeters(50));
+        assert_eq!(direction, Some(-1));
+    }
+
+    #[test]
+    fn clamp_reverts_to_current_leg_after_new_leg_is_approached() {
+        let commands = vec![cmd(150), cmd(50)];
+
+        let (target, direction) =
+            effective_clamp_target_after_handoff(&commands, 0, true, Some(1), Position::from_millimeters(150), Some(1));
+
+        assert_eq!(target, Position::from_millimeters(150));
+        assert_eq!(direction, Some(1));
+    }
+
+    #[test]
+    fn zero_length_next_leg_does_not_keep_fake_approach_direction() {
+        let commands = vec![cmd(100), cmd(100)];
+
+        let (target, direction) =
+            effective_clamp_target_after_handoff(&commands, 1, false, None, Position::from_millimeters(100), None);
+
+        assert_eq!(target, Position::from_millimeters(100));
+        assert_eq!(direction, None);
     }
 
     // --- clamp_deceleration tests ---

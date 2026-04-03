@@ -21,6 +21,21 @@ pub struct UiManager {
     holding_start: bool,
 }
 
+const DEFAULT_COMMANDS: [MotionCommand; 2] = [
+    MotionCommand {
+        position: Position::ZERO,
+        velocity: Velocity::from_meters_per_second(1),
+        acceleration: Acceleration::from_millimeters_per_second_squared(500),
+        deceleration: Acceleration::from_millimeters_per_second_squared(500),
+    },
+    MotionCommand {
+        position: Position::ZERO,
+        velocity: Velocity::from_meters_per_second(1),
+        acceleration: Acceleration::from_millimeters_per_second_squared(500),
+        deceleration: Acceleration::from_millimeters_per_second_squared(500),
+    },
+];
+
 impl UiManager {
     pub fn new(io: super::IoManager) -> Self {
         let default_screen = ScreenSpec {
@@ -53,20 +68,7 @@ impl UiManager {
         UiManager {
             io,
             active_screen: default_screen,
-            motion_commands: [
-                MotionCommand {
-                    position: Position::ZERO,
-                    velocity: Velocity::from_millimeters_per_second(200),
-                    acceleration: Acceleration::from_meters_per_second_squared(2),
-                    deceleration: Acceleration::from_meters_per_second_squared(2),
-                },
-                MotionCommand {
-                    position: Position::ZERO,
-                    velocity: Velocity::from_millimeters_per_second(200),
-                    acceleration: Acceleration::from_meters_per_second_squared(2),
-                    deceleration: Acceleration::from_meters_per_second_squared(2),
-                },
-            ],
+            motion_commands: DEFAULT_COMMANDS,
             last_sent_variables: HashMap::new(),
             holding_start: false,
         }
@@ -315,20 +317,7 @@ impl UiManager {
                     } else if encoder_id == 2 {
                         variables.push(VariableEntry::HardwareControl(HardwareControl::Reset));
                     } else if encoder_id == 3 {
-                        self.motion_commands = [
-                            MotionCommand {
-                                position: Position::ZERO,
-                                velocity: Velocity::from_millimeters_per_second(200),
-                                acceleration: Acceleration::from_meters_per_second_squared(2),
-                                deceleration: Acceleration::from_meters_per_second_squared(2),
-                            },
-                            MotionCommand {
-                                position: Position::ZERO,
-                                velocity: Velocity::from_millimeters_per_second(200),
-                                acceleration: Acceleration::from_meters_per_second_squared(2),
-                                deceleration: Acceleration::from_meters_per_second_squared(2),
-                            },
-                        ];
+                        self.motion_commands = DEFAULT_COMMANDS;
 
                         messages.push(ClientMessage::UpsertCommandSet {
                             seq: 0,

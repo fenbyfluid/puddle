@@ -55,7 +55,7 @@ struct Options {
     #[clap(long, default_value = "5.0")]
     position_overshoot_limit: f64,
     /// Drive loop interval in milliseconds
-    #[clap(short, long, default_value = "5")]
+    #[clap(short, long, default_value = "2")]
     loop_interval: u64,
     /// Metrics table name
     #[clap(long, default_value = "puddle_stats")]
