@@ -156,8 +156,14 @@ Offset  Size    Field
 0       varies  encoder_labels[4]    All 4 encoder label pairs
 varies  1       left_main_type       0 = TextLines, 1 = Menu
 varies  varies  (left main area data, depending on type)
+varies  1       left animation type
+varies  2       left animation duration
+varies  2       left animation delay
 varies  1       right_main_type      0 = TextLines, 1 = Menu
 varies  varies  (right main area data, depending on type)
+varies  1       right animation type
+varies  2       right animation duration
+varies  2       right animation delay
 ```
 
 **Encoder labels** (always 4 entries, in encoder order):
@@ -710,9 +716,15 @@ type space is exhausted.
            label: "backup (empty)\0" },
        ]
      },
+     left_animation_type: None,
+     left_animation_duration: 0,
+     left_animation_delay: 0
      right_main: TextLines {
        ... same status display ...
-     }
+     },
+     right_animation_type: None,
+     right_animation_duration: 0,
+     right_animation_delay: 0
    }
 
 4. Firmware processes ScreenSpec:

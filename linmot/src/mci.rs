@@ -68,6 +68,33 @@ bitflags! {
     }
 }
 
+impl std::fmt::Display for WarningFlags {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let names: Vec<_> = self
+            .iter()
+            .map(|flag| match flag {
+                WarningFlags::MOTOR_HOT_SENSOR => "Motor hot sensor".to_owned(),
+                WarningFlags::MOTOR_SHORT_TIME_OVERLOAD => "Motor short time overload".to_owned(),
+                WarningFlags::MOTOR_SUPPLY_VOLTAGE_LOW => "Motor supply voltage low".to_owned(),
+                WarningFlags::MOTOR_SUPPLY_VOLTAGE_HIGH => "Motor supply voltage high".to_owned(),
+                WarningFlags::POSITION_LAG_ALWAYS => "Position lag always".to_owned(),
+                WarningFlags::DRIVE_HOT => "Drive hot".to_owned(),
+                WarningFlags::MOTOR_NOT_HOMED => "Motor not homed".to_owned(),
+                WarningFlags::PTC_SENSOR_1_HOT => "PTC sensor 1 hot".to_owned(),
+                WarningFlags::PTC_SENSOR_2_HOT => "PTC sensor 2 hot".to_owned(),
+                WarningFlags::REGENERATIVE_TEMP_OVERLOAD => "Regenerative temp overload".to_owned(),
+                WarningFlags::SPEED_LAG_ALWAYS => "Speed lag always".to_owned(),
+                WarningFlags::POSITION_SENSOR => "Position sensor".to_owned(),
+                WarningFlags::INTERFACE_WARN_FLAG => "Interface warn flag".to_owned(),
+                WarningFlags::APPLICATION_WARN_FLAG => "Application warn flag".to_owned(),
+                unknown => format!("{:?}", unknown),
+            })
+            .collect();
+
+        write!(f, "{}", names.join(", "))
+    }
+}
+
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ErrorCode {
@@ -96,6 +123,37 @@ pub enum ErrorCode {
     LessCalcTimeC2,
     LessCalcTimeC3,
     Unknown(u16),
+}
+
+impl std::fmt::Display for ErrorCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ErrorCode::NoError => write!(f, "No error"),
+            ErrorCode::LogicSupplyTooLow => write!(f, "Logic supply too low"),
+            ErrorCode::LogicSupplyTooHigh => write!(f, "Logic supply too high"),
+            ErrorCode::MotorSupplyTooLow => write!(f, "Motor supply too low"),
+            ErrorCode::MotorSupplyTooHigh => write!(f, "Motor supply too high"),
+            ErrorCode::MinPositionUndershot => write!(f, "Min position undershot"),
+            ErrorCode::MaxPositionOvershot => write!(f, "Max position overshot"),
+            ErrorCode::PositionLagAlwaysTooBig => write!(f, "Position lag always too big"),
+            ErrorCode::MotorHotSensor => write!(f, "Motor hot sensor"),
+            ErrorCode::MotorSliderMissing => write!(f, "Motor slider missing"),
+            ErrorCode::MotorShortTimeOverload => write!(f, "Motor short time overload"),
+            ErrorCode::MotorCommunicationLost => write!(f, "Motor communication lost"),
+            ErrorCode::NotHomed => write!(f, "Not homed"),
+            ErrorCode::UnknownMotionCommand => write!(f, "Unknown motion command"),
+            ErrorCode::PvtBufferOverflow => write!(f, "PVT buffer overflow"),
+            ErrorCode::PvtBufferUnderflow => write!(f, "PVT buffer underflow"),
+            ErrorCode::PvtControllerTooFast => write!(f, "PVT controller too fast"),
+            ErrorCode::PvtControllerTooSlow => write!(f, "PVT controller too slow"),
+            ErrorCode::MotionCommandInWrongState => write!(f, "Motion command in wrong state"),
+            ErrorCode::LessCalcTimeC0 => write!(f, "Less calc time C0"),
+            ErrorCode::LessCalcTimeC1 => write!(f, "Less calc time C1"),
+            ErrorCode::LessCalcTimeC2 => write!(f, "Less calc time C2"),
+            ErrorCode::LessCalcTimeC3 => write!(f, "Less calc time C3"),
+            ErrorCode::Unknown(e) => write!(f, "Unknown error code {}", e),
+        }
+    }
 }
 
 impl From<u16> for ErrorCode {

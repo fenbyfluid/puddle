@@ -246,12 +246,10 @@ impl CoreManager {
                 self.core_state.current_draw = feedback.current_draw;
                 self.core_state.drive_temperature = feedback.drive_temperature;
                 self.core_state.motor_temperature = feedback.motor_temperature;
-                self.core_state.warnings =
-                    feedback.warning_flags.iter_names().map(|(name, _)| name.to_owned()).collect();
+                self.core_state.warnings = feedback.warning_flags.iter().map(|flag| flag.to_string()).collect();
                 self.core_state.error_code = match feedback.error_code {
                     ErrorCode::NoError => None,
-                    // TODO: Format this correctly
-                    error_code => Some(format!("{:?}", error_code)),
+                    error_code => Some(error_code.to_string()),
                 };
 
                 self.send(None, CoreMessage::State { seq: None, state: self.core_state.clone() })

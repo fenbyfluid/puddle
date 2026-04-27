@@ -1,5 +1,6 @@
 use crate::hid::messages::{
-    DisplayContent, EncoderLabel, HardwareControl, HidInputEvent, InputReport, OutputReport, ScreenSpec, VariableEntry,
+    DisplayContent, EncoderLabel, HardwareControl, HidInputEvent, InputReport, OutputReport, ScreenAnimation,
+    ScreenSpec, VariableEntry,
 };
 use anyhow::Result;
 use log::trace;
@@ -55,6 +56,9 @@ impl UiManager {
                     c"Accel. {3}".to_owned(), // Acceleration
                 ],
             },
+            left_animation_type: ScreenAnimation::MoveTop,
+            left_animation_duration: 300,
+            left_animation_delay: 0,
             right_main: DisplayContent::TextLines {
                 top_margin: 11,
                 lines: vec![
@@ -63,6 +67,9 @@ impl UiManager {
                     c"{7}".to_owned(),       // Current OR warnings
                 ],
             },
+            right_animation_type: ScreenAnimation::MoveTop,
+            right_animation_duration: 300,
+            right_animation_delay: 0,
         };
 
         UiManager {
@@ -344,6 +351,11 @@ impl UiManager {
         // Be lazy, always calculate all the variables for now
         // We deduplicate them for sending, as otherwise it is noticeably slow
         {
+            variables.push(VariableEntry::HardwareControl(HardwareControl::SleepLevel {
+                can_deep_sleep: core_state.drive_state == DriveState::Disconnected
+                    || core_state.drive_state == DriveState::Off,
+            }));
+
             // LED rings
             let scale_to_u8 = |value: i32, limit: i32| -> u8 {
                 if limit <= 0 {

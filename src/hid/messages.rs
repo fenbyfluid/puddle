@@ -56,13 +56,60 @@ pub struct EncoderLabel {
     pub secondary: CString,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenAnimation {
+    None,
+    OverLeft,
+    OverRight,
+    OverTop,
+    OverBottom,
+    MoveLeft,
+    MoveRight,
+    MoveTop,
+    MoveBottom,
+    FadeIn,
+    FadeOut,
+    OutLeft,
+    OutRight,
+    OutTop,
+    OutBottom,
+}
+
+impl From<ScreenAnimation> for u8 {
+    fn from(value: ScreenAnimation) -> Self {
+        match value {
+            ScreenAnimation::None => 0,
+            ScreenAnimation::OverLeft => 1,
+            ScreenAnimation::OverRight => 2,
+            ScreenAnimation::OverTop => 3,
+            ScreenAnimation::OverBottom => 4,
+            ScreenAnimation::MoveLeft => 5,
+            ScreenAnimation::MoveRight => 6,
+            ScreenAnimation::MoveTop => 7,
+            ScreenAnimation::MoveBottom => 8,
+            ScreenAnimation::FadeIn => 9,
+            ScreenAnimation::FadeOut => 10,
+            ScreenAnimation::OutLeft => 11,
+            ScreenAnimation::OutRight => 12,
+            ScreenAnimation::OutTop => 13,
+            ScreenAnimation::OutBottom => 14,
+        }
+    }
+}
+
 /// A complete screen specification sent to the handheld controller.
 #[derive(Debug, Clone)]
 pub struct ScreenSpec {
     pub screen_id: u8,
     pub encoder_labels: [EncoderLabel; 4],
     pub left_main: DisplayContent,
+    pub left_animation_type: ScreenAnimation,
+    pub left_animation_duration: u16,
+    pub left_animation_delay: u16,
     pub right_main: DisplayContent,
+    pub right_animation_type: ScreenAnimation,
+    pub right_animation_duration: u16,
+    pub right_animation_delay: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
