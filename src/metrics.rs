@@ -2,7 +2,8 @@ use anyhow::{Result, anyhow};
 use linmot::mci::units::{Acceleration, Current, DriveTemperature, MotorTemperature, Position, Velocity};
 use linmot::mci::{Command, ControlFlags, MotionCommand, StatusFlags, WarningFlags};
 use linmot::udp::{Request, Response};
-use log::{trace, warn};
+use log::{info, trace, warn};
+use questdb::ErrorCode;
 use questdb::ingress::{Buffer, Sender, TimestampMicros};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -117,41 +118,78 @@ pub struct MetricSender {
 
 impl MetricSender {
     pub fn new(table_name: String, flush_limit: usize, flush_interval: Duration) -> Result<Self> {
-        let mut sender = Sender::from_env()?;
-        let mut buffer = sender.new_buffer();
-        let mut last_flush = Instant::now();
-        let (queue_tx, queue_rx) = mpsc::channel();
+        let (queue_tx, queue_rx) = mpsc::channel::<Record>();
+
+        let sender = match Sender::from_env() {
+            Ok(s) => Some(s),
+            Err(e) => {
+                if e.code() == ErrorCode::ConfigError {
+                    return Err(anyhow!(e));
+                }
+                warn!("Metrics reporting initially disabled due to connection error, will retry: {}", e);
+                None
+            }
+        };
 
         std::thread::spawn(move || {
-            loop {
-                // TODO: Set to a lower priority?
+            let mut sender = sender;
+            let mut buffer = sender.as_ref().map(|s| s.new_buffer());
+            let mut last_flush = Instant::now();
+            let mut retry_time = Duration::from_secs(1);
 
-                let mut tick = || -> Result<()> {
-                    let record: Record = queue_rx.recv()?;
+            while let Ok(record) = queue_rx.recv() {
+                let mut added_to_buffer = false;
+                loop {
+                    if sender.as_ref().map_or(true, |s| s.must_close()) {
+                        if sender.is_some() {
+                            warn!("Restarting metrics sender due to fatal connection error");
+                            sender = None;
+                        }
 
-                    if sender.must_close() {
-                        warn!("Restarting metrics sender due to fatal connection error");
-                        sender = Sender::from_env()?;
-                        buffer = sender.new_buffer();
+                        match Sender::from_env() {
+                            Ok(s) => {
+                                info!("Metrics reporting connected to QuestDB");
+                                buffer.get_or_insert_with(|| s.new_buffer());
+                                sender = Some(s);
+                                retry_time = Duration::from_secs(1);
+                            }
+                            Err(e) => {
+                                warn!("Metrics reporting reconnection failed: {}. Retrying in {:?}", e, retry_time);
+                                std::thread::sleep(retry_time);
+                                retry_time = (retry_time * 10).min(Duration::from_secs(30));
+                                continue;
+                            }
+                        }
+                    }
+
+                    let s = sender.as_mut().unwrap();
+                    let b = buffer.get_or_insert_with(|| s.new_buffer());
+
+                    if !added_to_buffer {
+                        let res = (|| -> Result<()> {
+                            b.table(table_name.as_str())?;
+                            record.add_to_buffer(b)?;
+                            Ok(())
+                        })();
+
+                        if let Err(e) = res {
+                            warn!("Failed to add record to metrics buffer: {}", e);
+                            break;
+                        }
+                        added_to_buffer = true;
+                    }
+
+                    if b.row_count() > flush_limit || last_flush.elapsed() > flush_interval {
+                        trace!("Flushing {} metrics entries after {:?}", b.row_count(), last_flush.elapsed());
+                        if let Err(e) = s.flush(b) {
+                            warn!("Failed to flush metrics: {}. Reconnecting...", e);
+                            sender = None;
+                            continue;
+                        }
                         last_flush = Instant::now();
                     }
 
-                    buffer.table(table_name.as_str())?;
-                    record.add_to_buffer(&mut buffer)?;
-
-                    if buffer.row_count() > flush_limit || last_flush.elapsed() > flush_interval {
-                        trace!("Flushing {} metrics entries after {:?}", buffer.row_count(), last_flush.elapsed());
-
-                        sender.flush(&mut buffer)?;
-                        last_flush = Instant::now();
-                    }
-
-                    Ok(())
-                };
-
-                if let Err(err) = tick() {
-                    warn!("Metric loop error: {}", err);
-                    continue;
+                    break;
                 }
             }
         });
